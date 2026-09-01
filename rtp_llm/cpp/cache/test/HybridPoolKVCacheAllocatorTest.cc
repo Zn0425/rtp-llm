@@ -121,6 +121,56 @@ static CacheConfig makeTinySwaMultiPoolHybridConfig(uint32_t linear_block_num = 
     return config;
 }
 
+// Force per-group key mapping while retaining one LINEAR group whose span
+// equals the physical FULL page: FULL(B), LINEAR(B), LINEAR(2B), B=4.
+static CacheConfig makeTinyMixedSpanLinearPoolConfig() {
+    auto config            = makeTinyMultiPoolHybridConfig(/*linear_block_num=*/16, /*full_block_num=*/16);
+    auto full_spec         = std::dynamic_pointer_cast<MHAKVCacheSpec>(config.cache_specs[1]);
+    auto linear_spec       = std::dynamic_pointer_cast<LinearKVCacheSpec>(config.cache_specs[0]);
+    full_spec->layer_num   = 1;
+    linear_spec->layer_num = 1;
+    auto long_linear_spec  = std::make_shared<LinearKVCacheSpec>(*linear_spec);
+    long_linear_spec->seq_size_per_block = 8;
+
+    config.layer_num        = 3;
+    config.layer_all_num    = 3;
+    config.group_layer_num  = 1;
+    config.linear_step      = 1;
+    config.layer_ids        = {{0}, {1}, {2}};
+    config.global_layer_ids = config.layer_ids;
+    config.full_groups      = {{0}};
+    config.linear_groups    = {{1}, {2}};
+    config.full_group_num   = 1;
+    config.linear_group_num = 2;
+    config.cache_specs      = {full_spec, linear_spec, long_linear_spec};
+    config.group_types      = {CacheGroupType::FULL, CacheGroupType::LINEAR, CacheGroupType::LINEAR};
+    config.group_region_names.assign(3, KVCacheRegionName::DEFAULT);
+    config.group_seq_size_per_block = {4, 4, 8};
+    config.group_block_nums         = {16, 16, 16};
+    config.layer_to_group_id        = {0, 1, 2};
+    config.layer_to_group_ids       = {{0}, {1}, {2}};
+    config.layer_group_types        = config.group_types;
+    config.layer_region_to_group_id.assign(3,
+                                           std::vector<int>(static_cast<size_t>(KVCacheRegionName::REGION_COUNT), -1));
+    config.group_kv_block_stride_bytes.clear();
+    config.group_kv_scale_stride_bytes.assign(3, 0);
+    config.group_block_size_bytes.clear();
+    config.layer_to_block_stride_bytes.clear();
+    config.kv_block_size_bytes = 0;
+    for (size_t gid = 0; gid < config.cache_specs.size(); ++gid) {
+        config.layer_region_to_group_id[gid][static_cast<size_t>(KVCacheRegionName::DEFAULT)] = static_cast<int>(gid);
+        const auto stride = config.cache_specs[gid]->block_size_bytes();
+        config.group_kv_block_stride_bytes.push_back(stride);
+        config.group_block_size_bytes.push_back(stride);
+        config.layer_to_block_stride_bytes.push_back(static_cast<int>(stride));
+        config.kv_block_size_bytes += stride;
+    }
+    config.kv_block_stride_bytes =
+        *std::max_element(config.group_kv_block_stride_bytes.begin(), config.group_kv_block_stride_bytes.end());
+    config.block_size_bytes = config.kv_block_size_bytes;
+    return config;
+}
+
 static ModelConfig makeTinyDSV4ModelConfig() {
     ModelConfig mc;
     mc.num_layers                        = 5;
@@ -1025,6 +1075,306 @@ TEST_F(HybridPoolKVCacheAllocatorTest, KimiK3ReplicatedDecodeAllocatesCanonicalF
         FreeInfo free_info{batch_res, token_ids};
         allocator->free(free_info);
         expectPoolCountersEq(allocator, counters_before);
+    }
+}
+
+TEST_F(HybridPoolKVCacheAllocatorTest, KimiK3ReplicatedDecodePublishesAndReusesCompactLinearCheckpointKeys) {
+    constexpr int kPhysicalPageTokens = 128;
+    constexpr int kShardCount         = 8;
+    constexpr int kCheckpointTokens   = kPhysicalPageTokens * kShardCount;
+    constexpr int kSeedInputLen       = 8 * kCheckpointTokens;
+
+    const auto config     = makeTinyKimiK3HybridPoolConfig(RoleType::DECODE,
+                                                       /*local_kv_page_rr_enabled=*/false,
+                                                       /*prefill_cp_size=*/kShardCount,
+                                                       /*block_num=*/128);
+    const int  full_gid   = findGroupId(config, CacheGroupType::FULL);
+    const int  linear_gid = findGroupId(config, CacheGroupType::LINEAR);
+    ASSERT_GE(full_gid, 0);
+    ASSERT_GE(linear_gid, 0);
+    ASSERT_EQ(config.group_seq_size_per_block[static_cast<size_t>(linear_gid)], kCheckpointTokens);
+
+    auto allocator = makeAllocator(config, RoleType::DECODE);
+    ASSERT_TRUE(allocator->init());
+
+    // CompleteTokenIds contains the first sampled token, while the cache holds
+    // the original input.  PD transferred only the terminal LINEAR slot.
+    auto seed_resource = makeBatchResource(/*batch_size=*/1, config);
+    auto seed_keys     = makeSequentialCacheKeys(static_cast<size_t>(kSeedInputLen / kPhysicalPageTokens));
+    seed_resource->setBatchCacheKeys(0, seed_keys);
+    auto       seed_tokens = makeCompleteTokenIds(/*batch_size=*/1, kSeedInputLen + 1, kPhysicalPageTokens);
+    MallocInfo seed_malloc{seed_resource, seed_tokens};
+    seed_malloc.enable_device_cache = false;
+    seed_malloc.reuse_cache         = true;
+    ASSERT_TRUE(allocator->malloc(seed_malloc).success);
+    ASSERT_EQ(seed_resource->blocksNum(0, full_gid), 65u);
+    ASSERT_EQ(seed_resource->blocksNum(0, linear_gid), 9u);
+    const auto terminal_linear_block = seed_resource->blocks(0, linear_gid)[7];
+
+    InsertInfo seed_insert{seed_resource, seed_tokens, /*is_resident=*/false};
+    seed_insert.pd_loaded_input_length = kSeedInputLen;
+    allocator->insertIntoCache(seed_insert);
+
+    // LINEAR slot 7 represents the checkpoint ending at physical page 63.
+    // Allocated-but-untransferred history slots must not become matchable.
+    EXPECT_TRUE(isNullBlockIdx(allocator->sharedBlockCache()->matchGroup(seed_keys[7], linear_gid)));
+    EXPECT_EQ(allocator->sharedBlockCache()->matchGroup(seed_keys[63], linear_gid), terminal_linear_block);
+
+    FreeInfo seed_free{seed_resource, seed_tokens};
+    allocator->free(seed_free);
+
+    constexpr int kExtendInputLen = kSeedInputLen + kPhysicalPageTokens + 1;
+    auto          extend_resource = makeBatchResource(/*batch_size=*/1, config);
+    auto          extend_keys =
+        makeSequentialCacheKeys(static_cast<size_t>((kExtendInputLen + kPhysicalPageTokens - 1) / kPhysicalPageTokens));
+    extend_resource->setBatchCacheKeys(0, extend_keys);
+    auto       extend_tokens = makeCompleteTokenIds(/*batch_size=*/1, kExtendInputLen, kPhysicalPageTokens);
+    MallocInfo extend_malloc{extend_resource, extend_tokens};
+    extend_malloc.enable_device_cache = true;
+    extend_malloc.reuse_cache         = true;
+    const auto extend_result          = allocator->malloc(extend_malloc);
+
+    ASSERT_TRUE(extend_result.success);
+    EXPECT_EQ(extend_result.reuse_len, kSeedInputLen);
+    EXPECT_EQ(extend_resource->blocksNum(0, full_gid), 66u);
+    ASSERT_EQ(extend_resource->blocksNum(0, linear_gid), 9u);
+    EXPECT_EQ(extend_resource->blocks(0, linear_gid)[7], terminal_linear_block);
+
+    FreeInfo extend_free{extend_resource, extend_tokens};
+    allocator->free(extend_free);
+}
+
+TEST_F(HybridPoolKVCacheAllocatorTest, KimiK3ReplicatedDecodePublishesOnlyComputedPdLinearCheckpoints) {
+    constexpr int kPhysicalPageTokens = 128;
+    constexpr int kShardCount         = 8;
+    constexpr int kCheckpointTokens   = kPhysicalPageTokens * kShardCount;
+    constexpr int kInputLen           = 8 * kCheckpointTokens + kPhysicalPageTokens + 1;
+
+    const auto config     = makeTinyKimiK3HybridPoolConfig(RoleType::DECODE,
+                                                       /*local_kv_page_rr_enabled=*/false,
+                                                       /*prefill_cp_size=*/kShardCount,
+                                                       /*block_num=*/128);
+    const int  linear_gid = findGroupId(config, CacheGroupType::LINEAR);
+    ASSERT_GE(linear_gid, 0);
+
+    auto allocator = makeAllocator(config, RoleType::DECODE);
+    ASSERT_TRUE(allocator->init());
+
+    auto publish = [&](int cached_token_len, CacheKeyType first_key) {
+        auto resource = makeBatchResource(/*batch_size=*/1, config);
+        auto keys     = makeSequentialCacheKeys(static_cast<size_t>(cached_token_len / kPhysicalPageTokens), first_key);
+        resource->setBatchCacheKeys(0, keys);
+        auto       tokens = makeCompleteTokenIds(/*batch_size=*/1, cached_token_len + 1, kPhysicalPageTokens);
+        MallocInfo malloc_info{resource, tokens};
+        malloc_info.enable_device_cache = false;
+        malloc_info.reuse_cache         = true;
+        EXPECT_TRUE(allocator->malloc(malloc_info).success);
+
+        InsertInfo insert_info{resource, tokens, /*is_resident=*/false};
+        insert_info.pd_loaded_input_length = kInputLen;
+        allocator->insertIntoCache(insert_info);
+
+        const auto linear_blocks = resource->blocks(0, linear_gid);
+        FreeInfo   free_info{resource, tokens};
+        allocator->free(free_info);
+        return std::make_pair(std::move(keys), linear_blocks);
+    };
+
+    // The non-aligned input terminal occupies slot 8, but it is not a reusable
+    // 9216-token checkpoint until Decode actually reaches that boundary.
+    const auto before = publish(/*cached_token_len=*/kInputLen, /*first_key=*/2000);
+    ASSERT_GT(before.first.size(), 63u);
+    EXPECT_TRUE(isNullBlockIdx(allocator->sharedBlockCache()->matchGroup(before.first[63], linear_gid)));
+
+    constexpr int kNextCheckpoint                = 9 * kCheckpointTokens;
+    const auto [after_keys, after_linear_blocks] = publish(kNextCheckpoint, /*first_key=*/3000);
+    ASSERT_GT(after_keys.size(), 71u);
+    ASSERT_GT(after_linear_blocks.size(), 8u);
+    EXPECT_TRUE(isNullBlockIdx(allocator->sharedBlockCache()->matchGroup(after_keys[63], linear_gid)));
+    EXPECT_EQ(allocator->sharedBlockCache()->matchGroup(after_keys[71], linear_gid), after_linear_blocks[8]);
+}
+
+TEST_F(HybridPoolKVCacheAllocatorTest, KimiK3ReplicatedBaselineDoesNotReuseUnloadedPdHistory) {
+    for (const int checkpoint : {256, 512, 1024, 2048}) {
+        SCOPED_TRACE(checkpoint);
+        const auto config     = makeTinyKimiK3HybridPoolConfig(RoleType::DECODE, false, 0, 64, checkpoint);
+        const int  linear_gid = findGroupId(config, CacheGroupType::LINEAR);
+        const int  full_gid   = findGroupId(config, CacheGroupType::FULL);
+        ASSERT_EQ(config.group_seq_size_per_block[linear_gid], checkpoint);
+        ASSERT_EQ(config.group_seq_size_per_block[full_gid], checkpoint);
+        auto allocator = makeAllocator(config, RoleType::DECODE);
+        ASSERT_TRUE(allocator->init());
+
+        const int seed_length = 8 * checkpoint;
+        auto      seed        = makeBatchResource(1, config);
+        auto      seed_keys   = makeSequentialCacheKeys(8);
+        seed->setBatchCacheKeys(0, seed_keys);
+        auto       seed_tokens = makeCompleteTokenIds(1, seed_length + 1, checkpoint);
+        MallocInfo seed_malloc{seed, seed_tokens};
+        seed_malloc.enable_device_cache = false;
+        seed_malloc.reuse_cache         = true;
+        ASSERT_TRUE(allocator->malloc(seed_malloc).success);
+        const auto seed_tail = seed->blocks(0, linear_gid)[7];
+        InsertInfo seed_insert{seed, seed_tokens, false};
+        seed_insert.pd_loaded_input_length = seed_length;
+        allocator->insertIntoCache(seed_insert);
+        for (size_t i = 0; i < 7; ++i) {
+            EXPECT_TRUE(isNullBlockIdx(allocator->sharedBlockCache()->matchGroup(seed_keys[i], linear_gid))) << i;
+            EXPECT_FALSE(isNullBlockIdx(allocator->sharedBlockCache()->matchGroup(seed_keys[i], full_gid))) << i;
+        }
+        EXPECT_EQ(allocator->sharedBlockCache()->matchGroup(seed_keys[7], linear_gid), seed_tail);
+        FreeInfo seed_free{seed, seed_tokens};
+        allocator->free(seed_free);
+
+        // PD transfers the terminal state at 9V+1, leaving the historical 9V
+        // slot uninitialized. Only the jointly reused 8V state is matchable.
+        const int extension = 9 * checkpoint + 1;
+        auto      keys      = makeSequentialCacheKeys(10);
+        auto      extend    = makeBatchResource(1, config);
+        extend->setBatchCacheKeys(0, keys);
+        auto       extend_tokens = makeCompleteTokenIds(1, extension + 1, checkpoint);
+        MallocInfo extend_malloc{extend, extend_tokens};
+        extend_malloc.enable_device_cache = true;
+        extend_malloc.reuse_cache         = true;
+        const auto extended               = allocator->malloc(extend_malloc);
+        ASSERT_TRUE(extended.success);
+        EXPECT_EQ(extended.reuse_len, seed_length);
+        InsertInfo extend_insert{extend, extend_tokens, false};
+        extend_insert.pd_loaded_input_length = extension;
+        allocator->insertIntoCache(extend_insert);
+        EXPECT_TRUE(isNullBlockIdx(allocator->sharedBlockCache()->matchGroup(keys[8], linear_gid)));
+        EXPECT_EQ(allocator->sharedBlockCache()->matchGroup(keys[7], linear_gid), seed_tail);
+        FreeInfo extend_free{extend, extend_tokens};
+        allocator->free(extend_free);
+
+        auto repeat = makeBatchResource(1, config);
+        repeat->setBatchCacheKeys(0, keys);
+        MallocInfo repeat_malloc{repeat, extend_tokens};
+        repeat_malloc.enable_device_cache = true;
+        repeat_malloc.reuse_cache         = true;
+        const auto repeated               = allocator->malloc(repeat_malloc);
+        ASSERT_TRUE(repeated.success);
+        EXPECT_EQ(repeated.reuse_len, seed_length);
+        FreeInfo repeat_free{repeat, extend_tokens};
+        allocator->free(repeat_free);
+
+        for (const int cached_length : {10 * checkpoint - 1, 10 * checkpoint, 10 * checkpoint + 1}) {
+            SCOPED_TRACE(cached_length);
+            auto decoded      = makeBatchResource(1, config);
+            auto decoded_keys = makeSequentialCacheKeys((cached_length + checkpoint - 1) / checkpoint);
+            decoded->setBatchCacheKeys(0, decoded_keys);
+            auto       decoded_tokens = makeCompleteTokenIds(1, cached_length + 1, checkpoint);
+            MallocInfo decoded_malloc{decoded, decoded_tokens};
+            decoded_malloc.enable_device_cache = true;
+            decoded_malloc.reuse_cache         = true;
+            ASSERT_TRUE(allocator->malloc(decoded_malloc).success);
+            const auto decoded_tail = decoded->blocks(0, linear_gid)[9];
+            InsertInfo decoded_insert{decoded, decoded_tokens, false};
+            decoded_insert.pd_loaded_input_length = extension;
+            allocator->insertIntoCache(decoded_insert);
+            EXPECT_TRUE(isNullBlockIdx(allocator->sharedBlockCache()->matchGroup(decoded_keys[8], linear_gid)));
+            const auto published = allocator->sharedBlockCache()->matchGroup(decoded_keys[9], linear_gid);
+            if (cached_length < 10 * checkpoint) {
+                EXPECT_TRUE(isNullBlockIdx(published));
+            } else {
+                EXPECT_EQ(published, decoded_tail);
+            }
+            FreeInfo decoded_free{decoded, decoded_tokens};
+            allocator->free(decoded_free);
+        }
+
+        auto after_decode = makeBatchResource(1, config);
+        after_decode->setBatchCacheKeys(0, makeSequentialCacheKeys(11));
+        auto       after_decode_tokens = makeCompleteTokenIds(1, 10 * checkpoint + 1, checkpoint);
+        MallocInfo after_decode_malloc{after_decode, after_decode_tokens};
+        after_decode_malloc.enable_device_cache = true;
+        after_decode_malloc.reuse_cache         = true;
+        const auto after_decode_result          = allocator->malloc(after_decode_malloc);
+        ASSERT_TRUE(after_decode_result.success);
+        EXPECT_EQ(after_decode_result.reuse_len, 10 * checkpoint);
+        FreeInfo after_decode_free{after_decode, after_decode_tokens};
+        allocator->free(after_decode_free);
+    }
+}
+
+TEST_F(HybridPoolKVCacheAllocatorTest, MixedSpanPdLinearPublicationRequiresComputedCheckpoints) {
+    constexpr int kPageTokens            = 4;
+    constexpr int kPdInputLength         = 5 * kPageTokens + 1;
+    constexpr int kFullGroup             = 0;
+    constexpr int kLinearPageGroup       = 1;
+    constexpr int kLinearDoublePageGroup = 2;
+    const auto    config                 = makeTinyMixedSpanLinearPoolConfig();
+    // The mixed-span path must gate both LINEAR groups, including LINEAR(B).
+    ASSERT_EQ(config.group_seq_size_per_block, (std::vector<size_t>{4, 4, 8}));
+    for (size_t gid = 0; gid < config.cache_specs.size(); ++gid) {
+        ASSERT_EQ(config.cache_specs[gid]->seq_size_per_block, config.group_seq_size_per_block[gid]);
+    }
+
+    for (const bool pd_loaded : {true, false}) {
+        for (const auto& [cached_length, pd_reuse, non_pd_reuse] :
+             {std::tuple<int, int, int>{6 * kPageTokens - 1, 0, 4 * kPageTokens},
+              std::tuple<int, int, int>{6 * kPageTokens, 6 * kPageTokens, 6 * kPageTokens},
+              std::tuple<int, int, int>{6 * kPageTokens + 1, 6 * kPageTokens, 6 * kPageTokens}}) {
+            SCOPED_TRACE(::testing::Message() << "pd_loaded=" << pd_loaded << " cached_length=" << cached_length);
+            // Isolate cases so a previously computed 6B checkpoint cannot mask
+            // erroneous publication in the 6B-1 case.
+            auto allocator = makeAllocator(config, RoleType::DECODE);
+            ASSERT_TRUE(allocator->init());
+            auto       seed = makeBatchResource(1, config);
+            const auto keys = makeSequentialCacheKeys((cached_length + kPageTokens) / kPageTokens);
+            seed->setBatchCacheKeys(0, keys);
+            // insertIntoCache excludes the final, not-yet-cached token.
+            auto       tokens = makeCompleteTokenIds(1, cached_length + 1, kPageTokens);
+            MallocInfo seed_malloc{seed, tokens};
+            seed_malloc.enable_device_cache = false;
+            seed_malloc.reuse_cache         = true;
+            ASSERT_TRUE(allocator->malloc(seed_malloc).success);
+            const auto page_states        = seed->blocks(0, kLinearPageGroup);
+            const auto double_page_states = seed->blocks(0, kLinearDoublePageGroup);
+            ASSERT_GE(page_states.size(), 6u);
+            ASSERT_GE(double_page_states.size(), 3u);
+            for (const auto block : {page_states[3], page_states[5], double_page_states[1], double_page_states[2]}) {
+                ASSERT_FALSE(isNullBlockIdx(block));
+            }
+
+            InsertInfo insert{seed, tokens, false};
+            insert.pd_loaded_input_length = pd_loaded ? kPdInputLength : -1;
+            allocator->insertIntoCache(insert);
+            const auto cache = allocator->sharedBlockCache();
+            EXPECT_EQ(cache->matchGroup(keys[3], kFullGroup), seed->blocks(0, kFullGroup)[3]);
+            // 4B is allocated but was not transferred by the non-aligned PD
+            // input. Ordinary local Prefill history remains reusable.
+            EXPECT_EQ(cache->matchGroup(keys[3], kLinearPageGroup), pd_loaded ? NULL_BLOCK_IDX : page_states[3]);
+            EXPECT_EQ(cache->matchGroup(keys[3], kLinearDoublePageGroup),
+                      pd_loaded ? NULL_BLOCK_IDX : double_page_states[1]);
+            const bool computed_six_pages = cached_length >= 6 * kPageTokens;
+            EXPECT_EQ(cache->matchGroup(keys[5], kLinearPageGroup),
+                      computed_six_pages ? page_states[5] : NULL_BLOCK_IDX);
+            EXPECT_EQ(cache->matchGroup(keys[5], kLinearDoublePageGroup),
+                      computed_six_pages ? double_page_states[2] : NULL_BLOCK_IDX);
+            FreeInfo seed_free{seed, tokens};
+            allocator->free(seed_free);
+
+            auto next = makeBatchResource(1, config);
+            next->setBatchCacheKeys(0, makeSequentialCacheKeys(8));
+            auto       next_tokens = makeCompleteTokenIds(1, 7 * kPageTokens + 1, kPageTokens);
+            MallocInfo next_malloc{next, next_tokens};
+            next_malloc.enable_device_cache = true;
+            next_malloc.reuse_cache         = true;
+            const auto reused               = allocator->malloc(next_malloc);
+            ASSERT_TRUE(reused.success);
+            const int expected_reuse = pd_loaded ? pd_reuse : non_pd_reuse;
+            EXPECT_EQ(reused.reuse_len, expected_reuse);
+            if (expected_reuse > 0) {
+                const int page_tail        = expected_reuse / kPageTokens - 1;
+                const int double_page_tail = expected_reuse / (2 * kPageTokens) - 1;
+                EXPECT_EQ(next->blocks(0, kLinearPageGroup)[page_tail], page_states[page_tail]);
+                EXPECT_EQ(next->blocks(0, kLinearDoublePageGroup)[double_page_tail],
+                          double_page_states[double_page_tail]);
+            }
+            FreeInfo next_free{next, next_tokens};
+            allocator->free(next_free);
+        }
     }
 }
 

@@ -89,6 +89,11 @@ struct InsertInfo {
     CompleteTokenIdsPtr           complete_token_ids;
     bool                          is_resident;
     std::shared_ptr<CPSlotMapper> cp_slot_mapper;  // nullptr = redundant (default)
+    // Successfully loaded PD Decode resources may contain allocated LINEAR
+    // history slots that were never transferred.  A non-negative value lets
+    // hybrid insertion publish only the loaded terminal/checkpoint state and
+    // checkpoints subsequently computed by Decode.
+    int pd_loaded_input_length = -1;
 };
 
 }  // namespace rtp_llm

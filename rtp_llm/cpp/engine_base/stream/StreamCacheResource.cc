@@ -335,6 +335,11 @@ int StreamCacheResource::tryReleaseKVBlock(size_t nums) {
             // save cache to gpu
             if (enableDeviceCache()) {
                 InsertInfo insert_info{batch_kv_cache_resource_, stream_->completeTokenIdsPtr(), false};
+                if (resource_context_.role_type == RoleType::DECODE && !stream_->isContextStream()) {
+                    // PD transfers only the terminal input KDA checkpoint. Earlier
+                    // input states must not be advertised as reusable prefixes.
+                    insert_info.pd_loaded_input_length = stream_->inputLength();
+                }
                 resource_context_.cache_manager->insertIntoCache(insert_info);
             }
             storeCacheAsync(batch_kv_cache_resource_,

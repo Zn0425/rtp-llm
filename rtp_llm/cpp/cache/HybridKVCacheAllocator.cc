@@ -84,6 +84,28 @@ inline size_t groupSlotsForCanonicalKeys(const CacheConfig&                   co
     return (total_tokens + group_tokens - 1) / group_tokens;
 }
 
+inline bool pdLinearSlotIsPublishable(size_t block_pos,
+                                      size_t block_tokens,
+                                      size_t cached_token_len,
+                                      int    pd_loaded_input_length,
+                                      size_t device_reuse_pages,
+                                      size_t physical_page_tokens) {
+    if (pd_loaded_input_length < 0) {
+        return true;
+    }
+
+    const size_t checkpoint_end   = (block_pos + 1) * block_tokens;
+    const size_t input_length     = static_cast<size_t>(pd_loaded_input_length);
+    const size_t device_reuse_end = device_reuse_pages * physical_page_tokens;
+
+    // reuseCache materializes only its jointly matched LINEAR tail. Earlier
+    // slots may have been allocated as placeholders and are not valid states.
+    const bool reused_checkpoint = device_reuse_end > 0 && checkpoint_end == device_reuse_end;
+    const bool loaded_checkpoint = input_length % block_tokens == 0 && checkpoint_end == input_length;
+    const bool decode_checkpoint = checkpoint_end > input_length && checkpoint_end <= cached_token_len;
+    return reused_checkpoint || loaded_checkpoint || decode_checkpoint;
+}
+
 BlockIndicesType validBlocksAfter(const BlockIndicesType& blocks, size_t begin) {
     BlockIndicesType valid;
     if (begin >= blocks.size()) {
@@ -430,14 +452,30 @@ void HybridKVCacheAllocator::insertIntoCache(const InsertInfo& insert_info) {
         }
 
         if (!cp_active && !needs_group_key_mapping) {
-            // Groups with equal spans share one key.
-            const size_t max_keys = full_keys.size();
+            // Groups with equal spans share one key. PD still transfers only
+            // the terminal LINEAR state, so allocated history is not reusable.
+            size_t cached_token_len = 0;
+            if (insert_info.pd_loaded_input_length >= 0) {
+                const auto token_ids = insert_info.complete_token_ids->completeTokenIdsVec(batch_id);
+                cached_token_len     = token_ids.empty() ? 0 : token_ids.size() - 1;
+            }
+            const size_t device_reuse_pages = kv_cache_resource->cacheResource(batch_id).deviceReuseBlockNum();
+            const size_t max_keys           = full_keys.size();
             for (size_t pos = max_keys; pos > 0; --pos) {
                 const size_t              i = pos - 1;
                 std::vector<BlockIdxType> group_slots(static_cast<size_t>(group_nums), NULL_BLOCK_IDX);
                 bool                      has_valid = false;
                 for (int gid = 0; gid < group_nums; ++gid) {
                     if (skipReuseCacheGroup(gid)) {
+                        continue;
+                    }
+                    if (containsGroupId(linear_group_ids_, gid)
+                        && !pdLinearSlotIsPublishable(i,
+                                                      config_.seq_size_per_block,
+                                                      cached_token_len,
+                                                      insert_info.pd_loaded_input_length,
+                                                      device_reuse_pages,
+                                                      config_.seq_size_per_block)) {
                         continue;
                     }
                     const auto& blocks = kv_cache_resource->blocks(batch_id, gid);
@@ -526,11 +564,23 @@ void HybridKVCacheAllocator::insertIntoCache(const InsertInfo& insert_info) {
             const size_t blocks_by_keys  = src_keys.size() / key_stride;
             const auto&  blocks          = kv_cache_resource->blocks(batch_id, gid);
             const size_t loop_end        = std::min({full_blocks_num, blocks_by_keys, blocks.size()});
+            const bool   restrict_pd_linear =
+                insert_info.pd_loaded_input_length >= 0 && !cp_active && group_type == CacheGroupType::LINEAR;
+            const size_t device_reuse_pages = kv_cache_resource->cacheResource(batch_id).deviceReuseBlockNum();
 
             // Reverse iterate so prefix-base keys land at MRU end (matches non-CP path).
             for (size_t pos = loop_end; pos > 0; --pos) {
                 const size_t i = pos - 1;
                 if (isNullBlockIdx(blocks[i])) {
+                    continue;
+                }
+                if (restrict_pd_linear
+                    && !pdLinearSlotIsPublishable(i,
+                                                  static_cast<size_t>(group_seq_size),
+                                                  token_len,
+                                                  insert_info.pd_loaded_input_length,
+                                                  device_reuse_pages,
+                                                  config_.seq_size_per_block)) {
                     continue;
                 }
                 const size_t              key_index = (i + 1) * key_stride - 1;
