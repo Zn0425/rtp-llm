@@ -120,6 +120,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--rdma-prewarm-settle-s", type=float, default=2.0)
     parser.add_argument("--long-prefix-checkpoint", type=pathlib.Path)
     parser.add_argument("--long-prefix-tp-size", type=int, default=8)
+    parser.add_argument("--long-prefix-target-tokens", type=int, default=600000)
     parser.add_argument("--long-prefix-kernel-page-size", type=int, default=128)
     parser.add_argument("--expanded-kv-budget-bytes", type=int, default=4294967296)
     parser.add_argument("--timeout", type=int, default=900)
@@ -137,6 +138,7 @@ def parse_args() -> argparse.Namespace:
         "mtp_chunk_max_tokens",
         "timeout",
         "long_prefix_tp_size",
+        "long_prefix_target_tokens",
         "long_prefix_kernel_page_size",
         "rdma_prewarm_timeout",
     ):
@@ -997,6 +999,7 @@ class Runner:
             bytes_per_token=expanded_bytes_per_token(
                 self.args.long_prefix_checkpoint, self.args.long_prefix_tp_size
             ),
+            target_tokens=self.args.long_prefix_target_tokens,
         )
         try:
             result = case.run()
@@ -1008,7 +1011,7 @@ class Runner:
             )
         finally:
             self.records.extend(case.records)
-        self.health("long_prefix_cached_dialog_complete")
+        self.health("long_prefix_cached_dialog")
 
 
 def main() -> int:
