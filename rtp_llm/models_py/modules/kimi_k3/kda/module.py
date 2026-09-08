@@ -22,6 +22,10 @@ from rtp_llm.models_py.modules.factory import LinearFactory
 from rtp_llm.models_py.modules.factory.linear.parallel import row_parallel_linear
 from rtp_llm.models_py.modules.kimi_k3.all_gather_gemm import all_gather_gemm
 from rtp_llm.models_py.modules.kimi_k3.gemm_reduce_scatter import gemm_reduce_scatter
+from rtp_llm.models_py.modules.kimi_k3.projection_ktp import (
+    project_kda_inputs_ktp,
+    resolve_projection_local_heads,
+)
 from rtp_llm.models_py.modules.kimi_k3.kda.cache import KimiK3KDACache
 from rtp_llm.models_py.modules.kimi_k3.kda.decode import KimiK3KDADecode
 from rtp_llm.models_py.modules.kimi_k3.kda.prefill import (
@@ -64,6 +68,8 @@ class KimiK3KDA(nn.Module):
         self.head_dim = int(config.linear_attention_config.linear_key_head_dim)
         self.attn_tp_size = int(parallelism_config.get_attn_tp_size())
         self.attn_tp_rank = int(parallelism_config.get_attn_tp_rank())
+        self.ktp_size = int(getattr(parallelism_config, "ktp_size", 1))
+        self.ktp_rank = int(getattr(parallelism_config, "ktp_rank", 0))
         self.total_heads = int(config.linear_attention_config.linear_num_key_heads)
         if self.total_heads % self.attn_tp_size:
             raise ValueError(
@@ -72,6 +78,37 @@ class KimiK3KDA(nn.Module):
             )
         self.local_heads = self.total_heads // self.attn_tp_size
         self.projection_size = self.local_heads * self.head_dim
+        if self.ktp_size > 1:
+            if parallelism_config.role_type != RoleType.DECODE:
+                raise RuntimeError(
+                    "Projection KTP is Decode-only; Prefill and PDFUSION must use ktp_size=1"
+                )
+            if self.attn_tp_size != 1:
+                raise RuntimeError(
+                    f"Projection KTP requires attention TP=1, got {self.attn_tp_size}"
+                )
+            if self.ktp_size not in (8, 16):
+                raise RuntimeError(
+                    f"Projection KTP supports only sizes 8 and 16, got {self.ktp_size}"
+                )
+            if self.total_heads % self.ktp_size:
+                raise ValueError(
+                    f"KDA heads {self.total_heads} must be divisible by KTP {self.ktp_size}"
+                )
+        self.projection_local_heads = resolve_projection_local_heads(
+            total_heads=self.total_heads,
+            attention_tp_size=self.attn_tp_size,
+            ktp_size=self.ktp_size,
+        )
+        self.projection_local_size = self.projection_local_heads * self.head_dim
+        if self.ktp_size > 1 and self.layer_idx == 0:
+            logging.info(
+                "[K3_PROJECTION_KTP_LAYOUT] total_heads=%d local_projection_heads=%d "
+                "collectives=all_gather+all_to_all state_cache=dp_local "
+                "o_proj=replicated tensor_all_reduce=disabled",
+                self.total_heads,
+                self.projection_local_heads,
+            )
         self.history_size = (
             int(config.linear_attention_config.linear_conv_kernel_dim) - 1
         )
@@ -162,7 +199,9 @@ class KimiK3KDA(nn.Module):
                 layer_idx,
             )
         expected_fused_width = (
-            4 * self.projection_size + self.forget_latent_size + self.total_heads
+            4 * self.projection_local_size
+            + self.forget_latent_size
+            + self.total_heads
         )
         actual_fused_width = (
             self._fp8_projections[W.linear_attn_qkvg_fa_beta_w].N
@@ -229,6 +268,38 @@ class KimiK3KDA(nn.Module):
         torch.Tensor,
     ]:
         """Run and unpack the loader-provided Q/K/V/G/F_A/beta projection."""
+
+        # Some projection-contract tests intentionally construct the module via
+        # ``__new__``. Preserve the historical TP path unless KTP was explicitly
+        # initialized by the real constructor.
+        if getattr(self, "ktp_size", 1) > 1:
+            if prefill_sp_layout is not None:
+                raise RuntimeError("Projection KTP cannot run the Prefill SP path")
+            result = project_kda_inputs_ktp(
+                hidden_states,
+                self.kda_fused_w,
+                self._fp8_projections.get(
+                    W.linear_attn_f_b_w,
+                    self.weights[W.linear_attn_f_b_w],
+                ),
+                total_heads=self.total_heads,
+                head_dim=self.head_dim,
+                forget_latent_size=self.forget_latent_size,
+                ktp_size=self.ktp_size,
+                ktp_rank=self.ktp_rank,
+            )
+            mixed_qkv_projected = torch.cat(
+                (result.q, result.k, result.v), dim=-1
+            )
+            return (
+                mixed_qkv_projected,
+                result.q,
+                result.k,
+                result.v,
+                result.raw_gate,
+                result.raw_beta,
+                result.output_gate,
+            )
 
         if prefill_sp_layout is not None:
             projected_fused = all_gather_gemm(
