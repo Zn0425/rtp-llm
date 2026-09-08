@@ -96,6 +96,11 @@ class ServerArgsSetTest(TestCase):
             "dfs://bucket/jit/writer",
         )
 
+        # Verify grammar_config defaults to deterministic JSON whitespace.
+        self.assertTrue(
+            py_env_configs.grammar_config.constrained_json_disable_any_whitespace
+        )
+
     def test_cmd_args_set_to_py_env_configs(self):
         """Test that command line arguments are correctly set to py_env_configs."""
         sys.argv = [
