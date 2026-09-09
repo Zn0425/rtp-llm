@@ -34,7 +34,10 @@ cc_import(
 
 cc_import(
     name = "cuda13_torch_nvshmem",
-    shared_library = "@pip_gpu_cuda13_torch_torch//:site-packages/torch/lib/libtorch_nvshmem.so",
+    shared_library = select({
+        "@//:using_cuda13_arm": "@pip_cuda13_arm_torch_torch//:site-packages/torch/lib/libtorch_nvshmem.so",
+        "//conditions:default": "@pip_gpu_cuda13_torch_torch//:site-packages/torch/lib/libtorch_nvshmem.so",
+    }),
 )
 
 cuda12_torch_link_deps = select({

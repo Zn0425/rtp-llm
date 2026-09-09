@@ -175,12 +175,13 @@ void DecodeRpcServer::prepareGenerateContext(DecodeGenerateContext& decode_conte
         RTP_LLM_CHECK_WITH_INFO(
             decode_attention_tp == decode_context.prefill_attention_tp_size
                 || (projection_ktp && decode_attention_tp == 1
-                    && decode_context.prefill_attention_tp_size == 8),
-            "request [%s] K3 PD supports equal attention TP or P8 projection-KTP Decode; got P%d->D%d/KTP%d",
-                                decode_context.request_key.c_str(),
-                                decode_context.prefill_attention_tp_size,
-                                decode_attention_tp,
-                                decode_ktp);
+                    && (decode_context.prefill_attention_tp_size == 8
+                        || decode_context.prefill_attention_tp_size == 16)),
+            "request [%s] K3 PD supports equal attention TP or P8/P16 projection-KTP Decode; got P%d->D%d/KTP%d",
+            decode_context.request_key.c_str(),
+            decode_context.prefill_attention_tp_size,
+            decode_attention_tp,
+            decode_ktp);
         for (const auto& spec : cache_config.cache_specs) {
             const auto* linear_spec = dynamic_cast<const LinearKVCacheSpec*>(spec.get());
             if (linear_spec == nullptr) {
@@ -499,13 +500,13 @@ BroadcastLoadRequestPB DecodeRpcServer::constructRemoteLoadRequest(const LoadKVC
     const bool  equal_attention_tp =
         k3_hybrid_cache && decode_attention_tp > 1 && static_cast<size_t>(decode_attention_tp) == peer_addrs.size();
     // Keep generic unequal attention topologies rejected. Projection-KTP is
-    // the one explicit P8 fan-in contract and is validated separately.
+    // the explicit P8/P16 fan-in contract and is validated separately.
     RTP_LLM_CHECK_WITH_INFO(
         !k3_hybrid_cache || load_context.prefill_cp_size > 1 || equal_attention_tp || projection_ktp,
-                            "K3 hybrid cache PD requires equal attention TP or projection KTP, got D%d/KTP%d with %zu prefill peers",
-                            decode_attention_tp,
-                            decode_ktp,
-                            peer_addrs.size());
+        "K3 hybrid cache PD requires equal attention TP or projection KTP, got D%d/KTP%d with %zu prefill peers",
+        decode_attention_tp,
+        decode_ktp,
+        peer_addrs.size());
     if (load_context.prefill_cp_size > 1) {
         // CP-sharded prefill: pull from all peers (each holds 1/N RR shard)
         request.set_partition_count(1);
@@ -909,7 +910,7 @@ ErrorInfo DecodeRpcServer::loadCache(const LoadKVCacheContext& load_context) {
     std::vector<std::shared_ptr<LoadContext>> load_contexts;
     const bool                                is_page_level_rr = load_context.prefill_cp_size > 1
                                   && static_cast<int>(load_context.peer_addrs.size()) == load_context.prefill_cp_size;
-    // Receive-side fan-in serves Projection-KTP P8->D8/D16. Each segmented
+    // Receive-side fan-in serves Projection-KTP P8/P16->D8/D16. Each segmented
     // KDA group is split by its head layout across all ordered Prefill peers;
     // replicated MLA groups select exactly one source peer below. CP-sharded
     // Prefill uses the separate page-level RR path.
