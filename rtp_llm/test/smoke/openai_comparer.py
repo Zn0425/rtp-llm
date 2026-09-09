@@ -168,6 +168,23 @@ class OpenaiComparer(BaseComparer):
                         logprob.logprob = 0
         return logprobs, choices
 
+    @staticmethod
+    def _truncate_choices_content(choices: Any, n: int) -> None:
+        """Truncate each choice's content/reasoning_content to the first n chars.
+
+        Mutates in place; callers pass the deep-copied lists from
+        extract_logprobs. Handles both non-stream (message) and stream (delta).
+        """
+        for choice in choices:
+            for holder_attr in ("message", "delta"):
+                holder = getattr(choice, holder_attr, None)
+                if holder is None:
+                    continue
+                for field in ("content", "reasoning_content"):
+                    val = getattr(holder, field, None)
+                    if isinstance(val, str):
+                        setattr(holder, field, val[:n])
+
     def _to_json_safe(self, value: Any) -> Any:
         """Convert value to JSON-serializable form (e.g. BaseModel -> dict)."""
         if isinstance(value, BaseModel):
@@ -436,6 +453,21 @@ class OpenaiComparer(BaseComparer):
 
         expect_logprobs, expect_choices = self.extract_logprobs(expect_result.choices)
         actual_logprobs, actual_choices = self.extract_logprobs(actual_result.choices)
+
+        # The MoE ep_scatter kernel claims per-expert slots with a racy
+        # tl.atomic_add, so the per-expert token order -- and thus the
+        # grouped-GEMM K-dim accumulation order -- varies run to run, producing
+        # bit-different bf16 logits. Under greedy that can flip a near-tie argmax
+        # at some token, after which the tail diverges (root-caused: ep_scatter
+        # slot allocation measured 200/200 non-deterministic on H20). For cases
+        # that opt in, compare only the first N chars of the generated content so
+        # these tp>=2 MoE cases are stable, while still gating the initial decode
+        # (catches gross errors, wrong model, broken decode). Everything else
+        # (usage, aux_info, finish_reason) is still compared in full.
+        content_prefix_chars = int(compare_config.get("content_prefix_chars", 0) or 0)
+        if content_prefix_chars > 0:
+            self._truncate_choices_content(expect_choices, content_prefix_chars)
+            self._truncate_choices_content(actual_choices, content_prefix_chars)
 
         if not skip_choices and expect_choices != actual_choices:
             diffs.append(

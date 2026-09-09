@@ -85,6 +85,7 @@ class CaseRunner(object):
         kill_remote: bool = False,
         concurrency_test: bool = False,
         parallel_qr: int = 1,
+        golden_compare_prefix_chars: int = 0,
     ):
         self.task_info = task_info
         self.env_args = env_args
@@ -105,6 +106,7 @@ class CaseRunner(object):
         self.sleep_time_qr = sleep_time_qr
         self.kill_remote = kill_remote
         self.concurrency_test = concurrency_test
+        self.golden_compare_prefix_chars = max(0, int(golden_compare_prefix_chars or 0))
         # ``parallel_qr`` dispatches up to N fixture queries concurrently via a
         # ThreadPoolExecutor; defaults to 1 (sequential) to preserve existing
         # smoke behavior. >1 requires the server's --concurrency_limit to be at
@@ -719,6 +721,14 @@ class CaseRunner(object):
             q_r["_taskinfo_rel_path"] = task_info.taskinfo_rel_path
             q_r["_query_idx"] = q_idx
             q_r["_reuse_cache_enabled"] = reuse_cache_enabled
+            # Opt-in relaxation for nondeterministic MoE cases: the ep_scatter
+            # kernel's racy atomic slot-claim makes greedy output flip a near-tie
+            # argmax run-to-run, so pin only a stable content prefix. Injected
+            # here (not in the golden JSON) so goldens stay untouched.
+            if self.golden_compare_prefix_chars > 0:
+                cc = dict(q_r.get("compare_config") or {})
+                cc.setdefault("content_prefix_chars", self.golden_compare_prefix_chars)
+                q_r["compare_config"] = cc
             # DashGrpcComparer needs to load a tokenizer client-side; the HTTP
             # comparers never see these fields so this is a no-op for them.
             q_r["_model_path"] = task_info.tokenizer_path or task_info.model_path

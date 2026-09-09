@@ -82,6 +82,13 @@ if __name__ == "__main__":
     parser.add_argument(
         "--concurrency_test", type=str, default="False", help="concurrent request mode"
     )
+    parser.add_argument(
+        "--golden_compare_prefix_chars",
+        type=int,
+        default=0,
+        help="if >0, compare only the first N chars of generated content "
+        "(test-only relaxation for nondeterministic MoE cases; goldens unchanged)",
+    )
     args, _ = parser.parse_known_args()
 
     logging.info(
@@ -125,6 +132,7 @@ if __name__ == "__main__":
         "sleep_time_qr": args.sleep_time_qr,
         "kill_remote": str_to_bool(args.kill_remote),
         "concurrency_test": str_to_bool(args.concurrency_test),
+        "golden_compare_prefix_chars": args.golden_compare_prefix_chars,
     }
     # prompt_batch queries are now routed to /batch_infer per-query in case_runner
     # (see CaseRunner._resolve_endpoint), no env-level switch needed.

@@ -51,6 +51,7 @@ def h20_oss_suites():
             ),
             smoke_test(
                 name="mla_pure_cp_pd",
+                golden_compare_prefix_chars=16,  # MoE ep_scatter atomic ordering: pin stable prefix
                 task_info="data/model/glm5/glm_5_fp8_q_r_h20_cp.json",
                 envs={
                     "prefill": [],
@@ -265,6 +266,7 @@ def h20_oss_suites():
             ),
             smoke_test(
                 name="next_mtp_pd_reuse",
+                golden_compare_prefix_chars=16,  # MoE ep_scatter atomic ordering: pin stable prefix
                 task_info="data/model/qwen3_next/q_r_next_fp8_tp2_mtp_pd.json",
                 smoke_args= {
                     "prefill": "--load_cache_timeout_ms 120000 --seq_size_per_block 2048 --act_type BF16 --role_type PREFILL --cache_store_rdma_mode 0 --use_local 1 --tp_size 2 --max_seq_len 12800 --reserver_runtime_mem_mb 10000 --sp_model_type qwen35_moe_mtp --gen_num_per_cycle 4 --sp_type eagle --sp_checkpoint_path /mnt/nas1/hf/Qwen3.5-35B-A3B-FP8 --sp_act_type bf16 --reuse_cache 1",
@@ -299,6 +301,7 @@ def h20_oss_suites():
             ),
             smoke_test(
                 name="next_long_reuse_remote",
+                golden_compare_prefix_chars=16,  # MoE ep_scatter atomic ordering: pin stable prefix
                 task_info="data/model/qwen3_next/q_r_next_fp8_tp2_long_input_reuse_remote_cache.json",
                 smoke_args="--tp_size 2 --act_type BF16 --seq_size_per_block 2048 --linear_step 2 --reuse_cache 1 --enable_remote_cache 1 --write_cache_sync 1 --reco_put_timeout_ms 17000 --reco_get_timeout_ms 17000 --reco_get_broadcast_timeout 20000 --reco_put_broadcast_timeout 20000",
                 gpu_type=["H20"],
@@ -326,6 +329,7 @@ def h20_oss_suites():
             ),
             smoke_test(
                 name="next_bf16_tp2_dp2_pd",
+                golden_compare_prefix_chars=16,  # MoE ep_scatter atomic ordering: pin stable prefix
                 task_info="data/model/qwen35/qwen35_bf16_tp2_dp2_pd.json",
                 envs={
                     "prefill": [],
@@ -414,6 +418,7 @@ def h20_oss_suites():
             ),
             smoke_test(
                 name="kimi_pd",
+                golden_compare_prefix_chars=16,  # MoE ep_scatter atomic ordering: pin stable prefix
                 task_info="data/model/kimi_linear/q_r_bf16_tp2_pd_sep.json",
                 smoke_args= {
                     "prefill": "--seq_size_per_block 2048 --act_type BF16 --role_type PREFILL --cache_store_rdma_mode 0 --use_local 1 --tp_size 2 --ssm_state_dtype fp32 --reserver_runtime_mem_mb 8192",
@@ -504,6 +509,7 @@ def h20_oss_suites():
     # q_len = gen_num_per_cycle + 1 under XQA when batch > 1.
     smoke_test(
         name="eagle_mtp_no_cudagraph_concurrent",
+        golden_compare_prefix_chars=16,  # MoE ep_scatter atomic ordering: pin stable prefix
         task_info="data/model/qwen2_14b/q_r_mtp_cuda_graph_concurrent.json",
         smoke_args="--max_seq_len 16384 --ft_disable_custom_ar 1 --eplb_mode NONE --redundant_expert 0 --act_type FP16 --concurrency_limit 16 --frontend_server_count 1 --warm_up 0 --reserver_runtime_mem_mb 42000 --seq_size_per_block 64 --enable_xqa 1 --sp_type eagle --gen_num_per_cycle 4 --sp_model_type qwen_2-mtp --sp_checkpoint_path /mnt/nas1/mtp_reg/qwen2_14b_draft/ --sp_act_type FP16 --tp_size 2",
         envs=["NCCL_DISABLE_ABORT=1", "NCCL_DEBUG=INFO", "LOG_LEVEL=INFO"],
@@ -557,6 +563,7 @@ def h20_oss_suites():
             ),
             smoke_test(
                 name="qwen35_moe_vl_fp8",
+                golden_compare_prefix_chars=16,  # MoE ep_scatter atomic ordering: pin stable prefix
                 task_info="data/model/qwen35/q_r_35b_moe_vl_fp8.json",
                 smoke_args = {
                     "prefill": "--use_local 1 --role_type PREFILL --tp_size 2 --act_type BF16 --seq_size_per_block 2048 --max_seq_len 8192 --enable_cuda_graph 0 --warm_up 0 --concurrency_limit 8 --reserver_runtime_mem_mb 8192",

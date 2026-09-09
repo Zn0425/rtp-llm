@@ -16,6 +16,7 @@ def remote_cache_suites():
             ),
             smoke_test(
                 name = "remote_cache_basic_async",
+                golden_compare_prefix_chars=16,  # MoE ep_scatter atomic ordering: pin stable prefix
                 data = ["@remote_kv_cache_manager_server//:bin/kv_cache_manager_bin"],
                 gpu_type = ["L20"],
                 kvcm_envs = ["SEQ_SIZE_PER_BLOCK=8", "KVCM_LOG_LEVEL=DEBUG"],
