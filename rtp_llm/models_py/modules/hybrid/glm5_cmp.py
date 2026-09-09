@@ -726,6 +726,8 @@ class Glm5Cmp:
         fmha_impl: Any,
         kv_cache: Any,
     ) -> torch.Tensor:
+        # Keep CMP's BF16 absorbed query and original paged cache contract.
+        # Backend-specific temporary conversion belongs to the selected op.
         implementation = self._attention_impl(fmha_impl)
         cache = kv_cache.kv_cache_base
         if not implementation.fmha_impl.expects_paged_kv:
