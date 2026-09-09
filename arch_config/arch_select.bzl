@@ -217,6 +217,15 @@ def select_py_bindings():
         ],
     })
 
+def cuda13_test_exec_properties(gpu_count = 1):
+    """GPU test pools; internal builds override CUDA13 pool names."""
+    return select({
+        "@rtp_llm//:using_cuda13_arm": {"gpu": "SM100_ARM", "gpu_count": str(gpu_count)},
+        "@rtp_llm//:using_cuda13_x86": {"gpu": "SM100_X86", "gpu_count": str(gpu_count)},
+        "@rtp_llm//:using_cuda12_arm": {"gpu": "SM100_ARM", "gpu_count": str(gpu_count)},
+        "//conditions:default": {"gpu": "A10", "gpu_count": str(gpu_count)},
+    })
+
 def no_block_copy_link_deps():
     """Deps for the cc_library that defines execNoBlockCopy / warmupNoBlockCopy (per device)."""
     return select({

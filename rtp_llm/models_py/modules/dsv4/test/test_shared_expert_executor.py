@@ -6,23 +6,22 @@ from unittest import mock
 import torch
 import torch.nn as nn
 
-from rtp_llm.models_py.kernels.cuda.deepgemm_wrapper import (
-    is_deep_gemm_e8m0_used,
-)
-from rtp_llm.models_py.modules.dsv4.moe.expert import Expert
+from rtp_llm.models_py.kernels.cuda.deepgemm_wrapper import is_deep_gemm_e8m0_used
 from rtp_llm.models_py.modules.dsv4.moe._shared_expert_triton import (
     quant_bf16_fp8_packed_ue8m0,
 )
 from rtp_llm.models_py.modules.dsv4.moe._silu_mul_fp8_quant_triton import (
     silu_mul_fp8_quant_packed_from_parts,
 )
+from rtp_llm.models_py.modules.dsv4.moe.expert import Expert
 from rtp_llm.models_py.modules.dsv4.moe.shared_expert import (
+    _SHARED_EXPERT_STREAM_CACHE,
+    _SHARED_EXPERT_WORKSPACE_CACHE,
     FusedSharedExpertExecutor,
     FusedSharedExpertFastPath,
     OverlapSharedExpertExecutor,
     SequentialSharedExpertExecutor,
     W13SharedExpert,
-    _SHARED_EXPERT_STREAM_CACHE,
     combine_routed_and_shared,
     get_shared_expert_executor,
 )
@@ -191,6 +190,120 @@ def _fake_fp8_gemm_nt(a, b, output, *args, **kwargs) -> None:
 
 
 class TestSharedExpertExecutor(unittest.TestCase):
+    @staticmethod
+    def _prepare_only_shared(inter: int = 256, dim: int = 256) -> nn.Module:
+        shared = nn.Module()
+        shared.w13 = mock.Mock(
+            weight=torch.empty((2 * inter, dim)),
+            weight_scales=torch.empty((2 * inter, 1)),
+        )
+        shared.w2 = mock.Mock(
+            weight=torch.empty((dim, inter)),
+            weight_scales=torch.empty((dim, 1)),
+        )
+        return shared
+
+    def test_fast_path_prepare_infers_inter_dim(self):
+        fast_path = FusedSharedExpertFastPath(dim=256, inter_dim=None)
+
+        fast_path.prepare(self._prepare_only_shared(inter=256))
+
+        self.assertEqual(fast_path.inter_dim, 256)
+
+    def test_fast_path_prepare_uses_weight_inter_dim(self):
+        fast_path = FusedSharedExpertFastPath(dim=256, inter_dim=128)
+
+        fast_path.prepare(self._prepare_only_shared(inter=256))
+
+        self.assertEqual(fast_path.inter_dim, 256)
+
+    def test_workspace_views_are_shared_and_invalidated_on_growth(self):
+        _SHARED_EXPERT_WORKSPACE_CACHE.clear()
+        self.addCleanup(_SHARED_EXPERT_WORKSPACE_CACHE.clear)
+        first = FusedSharedExpertFastPath(
+            max_tokens_per_rank=4,
+            dim=128,
+            inter_dim=128,
+        )
+        second = FusedSharedExpertFastPath(
+            max_tokens_per_rank=4,
+            dim=128,
+            inter_dim=128,
+        )
+        grower = FusedSharedExpertFastPath(
+            max_tokens_per_rank=9,
+            dim=128,
+            inter_dim=128,
+        )
+        x3 = torch.empty((3, 128), dtype=torch.bfloat16)
+
+        def aligned(rows: int, element_size: int) -> int:
+            del element_size
+            return ((rows + 7) // 8) * 8
+
+        with mock.patch.object(
+            FusedSharedExpertFastPath,
+            "_tma_aligned_rows",
+            side_effect=aligned,
+        ):
+            workspace = first._ensure_workspace(x3)
+            views = first._workspace_views(workspace, 3)
+            self.assertIs(first._workspace_views(workspace, 3), views)
+
+            second_workspace = second._ensure_workspace(x3)
+            self.assertIs(second_workspace, workspace)
+            self.assertIs(second._workspace_views(second_workspace, 3), views)
+            self.assertEqual(tuple(views.x_fp8.shape), (3, 128))
+            self.assertEqual(tuple(views.x_scale.shape), (3, 1))
+            self.assertEqual(tuple(views.gate_up_bf16.shape), (3, 256))
+            self.assertEqual(tuple(views.hidden_fp8.shape), (3, 128))
+            self.assertEqual(tuple(views.hidden_scale.shape), (3, 1))
+            self.assertEqual(tuple(views.out_bf16.shape), (3, 128))
+
+            old_x_fp8 = workspace.x_fp8
+            grown_workspace = grower._ensure_workspace(
+                torch.empty((9, 128), dtype=torch.bfloat16)
+            )
+            self.assertIsNot(grown_workspace, workspace)
+            self.assertEqual(grown_workspace.capacity, 9)
+            self.assertEqual(grown_workspace.views, {})
+            self.assertIs(workspace.x_fp8, old_x_fp8)
+            self.assertEqual(workspace.capacity, 4)
+            self.assertIs(first._workspace, workspace)
+
+            first_grown = first._ensure_workspace(
+                torch.empty((9, 128), dtype=torch.bfloat16)
+            )
+            self.assertIs(first_grown, grown_workspace)
+            refreshed = first._workspace_views(first_grown, 3)
+            self.assertIsNot(refreshed, views)
+            self.assertIs(refreshed.x_fp8._base, grown_workspace.x_fp8)
+
+            # Variable-length traffic retains one cached shape, while callers
+            # holding previous views keep their original buffer references.
+            other_shape = first._workspace_views(first_grown, 5)
+            self.assertEqual(set(first_grown.views), {5})
+            self.assertEqual(tuple(other_shape.x_fp8.shape), (5, 128))
+            self.assertEqual(tuple(refreshed.x_fp8.shape), (3, 128))
+
+            first.prepare(self._prepare_only_shared(inter=256, dim=128))
+            resized = first._ensure_workspace(x3)
+            self.assertEqual(resized.hidden_fp8.size(1), 256)
+            self.assertEqual(grown_workspace.hidden_fp8.size(1), 128)
+
+    def test_overlap_threshold_short_circuits_capture_query(self):
+        executor = OverlapSharedExpertExecutor()
+        x = mock.Mock()
+        x.is_cuda = True
+        x.shape = (10 * 1024, 128)
+
+        with _env("DSV4_SHARED_EXPERT_STREAM_TOKEN_THRESHOLD", "4096"), mock.patch(
+            "torch.cuda.is_available", return_value=True
+        ), mock.patch("torch.cuda.is_current_stream_capturing") as capture_query:
+            self.assertFalse(executor._can_overlap(x))
+
+        capture_query.assert_not_called()
+
     def test_combine_preserves_fp32_accumulate_semantics(self):
         routed = torch.tensor([[1.0, 2.0], [3.0, 4.0]], dtype=torch.float32)
         shared = torch.tensor([[0.5, -0.25], [0.125, -0.5]], dtype=torch.float32)
@@ -224,13 +337,21 @@ class TestSharedExpertExecutor(unittest.TestCase):
 
     def test_executor_dispatch(self):
         os.environ.pop("DSV4_SHARED_EXPERT_MODE", None)
-        self.assertIsInstance(get_shared_expert_executor(), SequentialSharedExpertExecutor)
+        self.assertIsInstance(
+            get_shared_expert_executor(), SequentialSharedExpertExecutor
+        )
         with _env("DSV4_SHARED_EXPERT_MODE", "sequential"):
-            self.assertIsInstance(get_shared_expert_executor(), SequentialSharedExpertExecutor)
+            self.assertIsInstance(
+                get_shared_expert_executor(), SequentialSharedExpertExecutor
+            )
         with _env("DSV4_SHARED_EXPERT_MODE", "overlap"):
-            self.assertIsInstance(get_shared_expert_executor(), OverlapSharedExpertExecutor)
+            self.assertIsInstance(
+                get_shared_expert_executor(), OverlapSharedExpertExecutor
+            )
         with _env("DSV4_SHARED_EXPERT_MODE", "auto"):
-            self.assertIsInstance(get_shared_expert_executor(), OverlapSharedExpertExecutor)
+            self.assertIsInstance(
+                get_shared_expert_executor(), OverlapSharedExpertExecutor
+            )
 
     def test_sequential_executor(self):
         x = torch.randn(3, 4, dtype=torch.bfloat16)
@@ -291,7 +412,7 @@ class TestSharedExpertExecutor(unittest.TestCase):
         self.assertIn(device_index, _SHARED_EXPERT_STREAM_CACHE)
 
     @unittest.skipIf(not torch.cuda.is_available(), "CUDA required")
-    def test_overlap_capture_requires_precreated_stream(self):
+    def test_overlap_capture_falls_back_to_current_stream(self):
         _SHARED_EXPERT_STREAM_CACHE.clear()
         x = torch.randn(33, 128, device="cuda", dtype=torch.bfloat16)
         shared = _Shared().cuda()
@@ -301,8 +422,11 @@ class TestSharedExpertExecutor(unittest.TestCase):
             "torch.cuda.is_current_stream_capturing",
             return_value=True,
         ):
-            with self.assertRaisesRegex(RuntimeError, "not created before CUDA graph capture"):
-                executor.start(shared, x)
+            executor.start(shared, x)
+            self.assertIsNone(executor._active_stream)
+            got = executor.finish()
+
+        self.assertTrue(torch.equal(got, shared(x).float()))
 
     @unittest.skipIf(not torch.cuda.is_available(), "CUDA required")
     def test_overlap_executor_captures_with_precreated_stream(self):
@@ -322,7 +446,7 @@ class TestSharedExpertExecutor(unittest.TestCase):
             graph = torch.cuda.CUDAGraph()
             with torch.cuda.graph(graph):
                 executor.start(shared, x)
-                self.assertIs(executor._active_stream, warmup_stream)
+                self.assertIsNone(executor._active_stream)
                 out.copy_(executor.finish())
 
             x.mul_(2.0)
@@ -382,7 +506,9 @@ class TestSharedExpertExecutor(unittest.TestCase):
                 gemm_calls = []
 
                 def fake_with_record(a, b, output, *args, **kwargs):
-                    gemm_calls.append((tuple(a[0].shape), tuple(b[0].shape), tuple(output.shape)))
+                    gemm_calls.append(
+                        (tuple(a[0].shape), tuple(b[0].shape), tuple(output.shape))
+                    )
                     _fake_fp8_gemm_nt(a, b, output, *args, **kwargs)
 
                 with mock.patch(

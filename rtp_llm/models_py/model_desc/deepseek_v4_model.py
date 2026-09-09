@@ -56,8 +56,8 @@ from rtp_llm.models_py.modules.dsv4.moe.moe_layer import (
 )
 from rtp_llm.models_py.modules.dsv4.prefill.forward import forward_prefill
 from rtp_llm.models_py.modules.dsv4.transformer import V4Args, V4Transformer
-from rtp_llm.utils.warmup import model_warm_up_enabled
 from rtp_llm.ops import RoleType
+from rtp_llm.utils.warmup import model_warm_up_enabled
 
 
 def _materialize_meta_buffers(module: torch.nn.Module, device: str) -> int:
@@ -904,6 +904,7 @@ class DeepSeekV4Model(GptModelBase):
                     warmup_fp8_mqa_logits_jit,
                     warmup_mhc_head_fused_jit,
                     warmup_mhc_prenorm_gemm_jit,
+                    warmup_prefill_cp_metadata_jit,
                 )
 
                 _jit_device = _torch.device(device_str)
@@ -967,6 +968,19 @@ class DeepSeekV4Model(GptModelBase):
                     int(getattr(self.parallelism_config, "tp_size", 1) or 1)
                     if _prefill_cp_enabled
                     else 1
+                )
+                warmup_prefill_cp_metadata_jit(
+                    is_decode_role=self._is_decode_role,
+                    cp_enabled=_prefill_cp_enabled,
+                    cp_size=_prefill_cp_size,
+                    max_batch_size=max(
+                        int(self._max_context_batch_size),
+                        int(self._max_generate_batch_size),
+                        1,
+                    ),
+                    fp8_kv_cache=self.fp8_kv_cache,
+                    kv_cache_sharded=_prefill_kv_cache_sharded,
+                    device=_jit_device,
                 )
                 _dense_gemm_max_m = resolve_dense_gemm_warmup_max_m(
                     max_seq_len=int(self._v4_args.max_seq_len),

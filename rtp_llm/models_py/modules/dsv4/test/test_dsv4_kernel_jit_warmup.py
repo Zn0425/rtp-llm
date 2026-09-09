@@ -34,9 +34,10 @@ _stub_package(
     os.path.join(_REPO, "rtp_llm", "models_py", "modules", "dsv4"),
 )
 
+import rtp_llm.models_py.modules.dsv4.dsv4_kernel_jit_warmup as warmup_module
 from rtp_llm.models_py.modules.dsv4.dsv4_kernel_jit_warmup import (
-    _collect_dsv4_branch_kernel_configs,
     _collect_dsv4_batched_fp8_einsum_shapes,
+    _collect_dsv4_branch_kernel_configs,
     _collect_dsv4_dense_gemm_shapes,
     _collect_dsv4_fp8_mqa_logits_shapes,
     _collect_dsv4_mhc_head_fused_shapes,
@@ -56,6 +57,7 @@ from rtp_llm.models_py.modules.dsv4.dsv4_kernel_jit_warmup import (
     _state_ring_entries_warmup_values,
     _swa_slot_metadata_batch_warmup_sizes,
     _warmup_fused_kv_compress_norm_rope_insert,
+    resolve_dense_gemm_warmup_max_m,
     warmup_batched_fp8_einsum_jit,
     warmup_compressor_combine_branch_kernels,
     warmup_dense_gemm_jit,
@@ -63,9 +65,7 @@ from rtp_llm.models_py.modules.dsv4.dsv4_kernel_jit_warmup import (
     warmup_fp8_mqa_logits_jit,
     warmup_mhc_head_fused_jit,
     warmup_mhc_prenorm_gemm_jit,
-    resolve_dense_gemm_warmup_max_m,
 )
-import rtp_llm.models_py.modules.dsv4.dsv4_kernel_jit_warmup as warmup_module
 
 
 def _module_type(name, attrs):
@@ -97,6 +97,20 @@ class Dsv4KernelJitWarmupTest(unittest.TestCase):
                 cp_size=1,
                 device=device,
             )
+            with mock.patch.object(
+                warmup_module,
+                "_is_cuda_device",
+                side_effect=AssertionError("disabled warmup must not inspect CUDA"),
+            ):
+                warmup_module.warmup_prefill_cp_metadata_jit(
+                    is_decode_role=False,
+                    cp_enabled=True,
+                    cp_size=2,
+                    max_batch_size=3,
+                    fp8_kv_cache=True,
+                    kv_cache_sharded=True,
+                    device=torch.device("cuda"),
+                )
 
     def test_tilelang_prewarm_skips_when_model_warmup_disabled(self):
         from rtp_llm.models_py.modules.dsv4 import tilelang_kernels
@@ -815,9 +829,7 @@ class Dsv4KernelJitWarmupTest(unittest.TestCase):
             old_enabled = mhc_tilelang.tk_mhc_head_fused_enabled
             mhc_tilelang.tk_mhc_head_fused_enabled = lambda: True
             self.addCleanup(
-                lambda: setattr(
-                    mhc_tilelang, "tk_mhc_head_fused_enabled", old_enabled
-                )
+                lambda: setattr(mhc_tilelang, "tk_mhc_head_fused_enabled", old_enabled)
             )
 
             warmup_module._MHC_HEAD_FUSED_JIT_WARMED_KEYS.clear()
@@ -878,8 +890,10 @@ class Dsv4KernelJitWarmupTest(unittest.TestCase):
         self.assertEqual(_collect_dsv4_mhc_head_fused_shapes(root), {})
 
     def test_slot_dequant_warmup_uses_padded_cp_full_stride(self):
-        from rtp_llm.models_py.modules.dsv4.fp8 import _swa_dequant_triton
-        from rtp_llm.models_py.modules.dsv4.fp8 import _swa_ops_triton
+        from rtp_llm.models_py.modules.dsv4.fp8 import (
+            _swa_dequant_triton,
+            _swa_ops_triton,
+        )
 
         calls = []
         metadata_batches = []
@@ -1062,10 +1076,12 @@ class Dsv4KernelJitWarmupTest(unittest.TestCase):
         )
 
     def test_jit_kernel_specialization_contracts(self):
-        from rtp_llm.models_py.modules.dsv4.fp8 import _compressor_vllm_triton
-        from rtp_llm.models_py.modules.dsv4.fp8 import _swa_dequant_triton
-        from rtp_llm.models_py.modules.dsv4.fp8 import _swa_kv_insert_triton
-        from rtp_llm.models_py.modules.dsv4.fp8 import _swa_ops_triton
+        from rtp_llm.models_py.modules.dsv4.fp8 import (
+            _compressor_vllm_triton,
+            _swa_dequant_triton,
+            _swa_kv_insert_triton,
+            _swa_ops_triton,
+        )
 
         compress_src = inspect.getsource(
             _compressor_vllm_triton._fused_kv_compress_norm_rope_insert_sparse_attn.fn
@@ -1158,7 +1174,7 @@ class Dsv4KernelJitWarmupTest(unittest.TestCase):
             calls.append(None)
             if len(calls) == 1:
                 raise RuntimeError(
-                    'Catastrophic error: cannot open source file '
+                    "Catastrophic error: cannot open source file "
                     '"/tmp/tmpxft_000011ba_00000000-7_tvm_kernels.cpp1.ii"'
                 )
 
@@ -1178,7 +1194,7 @@ class Dsv4KernelJitWarmupTest(unittest.TestCase):
             calls.append(None)
             if len(calls) == 1:
                 cause = RuntimeError(
-                    'Catastrophic error: cannot open source file '
+                    "Catastrophic error: cannot open source file "
                     '"/tmp/tmpxft_000011ba_00000000-7_tvm_kernels.cpp1.ii"'
                 )
                 raise RuntimeError("TileLang mhc_pre failed: shape=(1, 2)") from cause

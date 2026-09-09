@@ -172,9 +172,7 @@ def test_force_radix_sort():
 
 def test_fast_topk_v2_short_inputs_topk_512_1024():
     """Short prefill policy uses fast_topk_v2_variable for K=512/1024."""
-    if not _HAS_FAST_TOPK:
-        print("SKIP: rtp_llm_ops.fast_topk_v2_variable not built")
-        return
+    assert _HAS_FAST_TOPK, "rtp_llm_ops.fast_topk_v2_variable must be built"
 
     starts = torch.tensor([0, 17, 256, 2048], dtype=torch.int32, device="cuda")
     lens = torch.tensor([1536, 1200, 2048, 64], dtype=torch.int32, device="cuda")
