@@ -358,6 +358,7 @@ class ModelFactory:
             quantization_config=quantization_config,
             vit_config=vit_config,
         )
+        model_cls._apply_kv_cache_config(model_config, kv_cache_config)
         model_cls._post_build_model_config(model_config)
 
         # Set model metadata fields
@@ -482,6 +483,9 @@ class ModelFactory:
             kv_cache_config=engine_config.kv_cache_config,
             profiling_debug_logging_config=engine_config.profiling_debug_logging_config,
             embedding_config=None,  # Propose model doesn't need embedding_config
+        )
+        propose_model_cls._apply_kv_cache_config(
+            propose_model_config, engine_config.kv_cache_config
         )
         propose_model_cls._post_build_model_config(propose_model_config)
 
