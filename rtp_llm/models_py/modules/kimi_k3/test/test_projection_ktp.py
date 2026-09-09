@@ -1,5 +1,6 @@
 import unittest
 from types import SimpleNamespace
+from unittest import mock
 
 import torch
 
@@ -20,6 +21,10 @@ from rtp_llm.models_py.modules.kimi_k3.projection_ktp import (
     resolve_projection_local_heads,
     validate_projection_ktp_sp_type,
 )
+from rtp_llm.models_py.modules.factory.linear.quantized_activation import (
+    QuantizedActivation,
+)
+import rtp_llm.models_py.modules.kimi_k3.projection_ktp as projection_ktp
 
 
 class KtpStepPlanTest(unittest.TestCase):
@@ -188,6 +193,55 @@ class KtpStepPlanTest(unittest.TestCase):
 
 
 class KtpProjectionLayoutTest(unittest.TestCase):
+    def test_fp8_projection_input_gathers_values_and_repacks_scales(self):
+        local_values = torch.arange(256, dtype=torch.uint8).reshape(2, 128).view(
+            torch.float8_e4m3fn
+        )
+        local_scales = torch.tensor([[101, 102, 0, 0]], dtype=torch.int32)
+        local = QuantizedActivation(local_values, local_scales)
+
+        rank1_values = (torch.arange(256, dtype=torch.uint8) + 16).reshape(2, 128)
+        gathered_values = torch.cat((local_values.view(torch.uint8), rank1_values))
+        gathered_scales = torch.tensor(
+            [[101, 102, 0, 0], [201, 202, 0, 0]], dtype=torch.int32
+        )
+
+        with mock.patch.object(
+            projection_ktp,
+            "all_gather",
+            side_effect=(gathered_values, gathered_scales),
+        ) as gather:
+            result = projection_ktp._all_gather_projection_input(local, ktp_size=2)
+
+        self.assertIsInstance(result, QuantizedActivation)
+        torch.testing.assert_close(result.values.view(torch.uint8), gathered_values)
+        self.assertEqual(result.scale_wire.tolist(), [[101, 102, 201, 202]])
+        self.assertEqual(gather.call_count, 2)
+
+    def test_fp8_projection_input_removes_each_ranks_local_scale_padding(self):
+        local_values = torch.arange(128, dtype=torch.uint8).reshape(1, 128).view(
+            torch.float8_e4m3fn
+        )
+        local = QuantizedActivation(
+            local_values, torch.tensor([[11, 0, 0, 0]], dtype=torch.int32)
+        )
+        gathered_values = torch.cat(
+            tuple((local_values.view(torch.uint8) + 8 * rank) for rank in range(3))
+        )
+        gathered_scales = torch.tensor(
+            [[11, 0, 0, 0], [22, 0, 0, 0], [33, 0, 0, 0]],
+            dtype=torch.int32,
+        )
+
+        with mock.patch.object(
+            projection_ktp,
+            "all_gather",
+            side_effect=(gathered_values, gathered_scales),
+        ):
+            result = projection_ktp._all_gather_projection_input(local, ktp_size=3)
+
+        self.assertEqual(result.scale_wire.tolist(), [[11, 22, 33, 0x7F7F7F7F]])
+
     def test_projection_payload_accepts_quantized_linear_callables(self):
         torch.manual_seed(5)
         hidden = torch.randn(4, 3)

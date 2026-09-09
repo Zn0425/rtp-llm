@@ -13,6 +13,9 @@ from rtp_llm.models_py.distributed.collective_torch import (
     all_gather,
     all_to_all_single,
 )
+from rtp_llm.models_py.modules.factory.linear.quantized_activation import (
+    QuantizedActivation,
+)
 
 
 def resolve_projection_local_heads(
@@ -412,7 +415,7 @@ class KtpProjectionResult:
 
 
 def _apply_projection(
-    inputs: torch.Tensor, projection: Any, *, name: str
+    inputs: torch.Tensor | QuantizedActivation, projection: Any, *, name: str
 ) -> torch.Tensor:
     """Apply either a dense weight tensor or a quantized Linear module."""
 
@@ -424,6 +427,74 @@ def _apply_projection(
         f"KTP {name} projection must be a Tensor or callable Linear, "
         f"got {type(projection).__name__}"
     )
+
+
+def _all_gather_projection_input(
+    local_input: torch.Tensor | QuantizedActivation,
+    *,
+    ktp_size: int,
+) -> torch.Tensor | QuantizedActivation:
+    """Gather either BF16 rows or the complete group128 FP8 wire format.
+
+    ``QuantizedActivation`` is deliberately not a Tensor subclass.  Its FP8
+    values and UE8M0 scales therefore have to be communicated independently,
+    then repacked into the row-major global KTP order expected by the FP8
+    projection.  Per-rank scale padding is removed before the global wire is
+    assembled; otherwise graph buckets 1 and 2 would attach the wrong scale to
+    rows from ranks after rank 0.
+    """
+
+    if not isinstance(local_input, QuantizedActivation):
+        return all_gather(local_input.contiguous(), group=Group.KTP)
+
+    local_rows, hidden_size = local_input.shape
+    local_scale_columns = int(local_input.scale_wire.shape[1])
+    scale_groups = int(local_input.scale_wire.shape[0])
+
+    gathered_values_wire = all_gather(
+        local_input.values.view(torch.uint8).contiguous(), group=Group.KTP
+    )
+    gathered_values = gathered_values_wire.view(torch.float8_e4m3fn)
+    expected_values_shape = (ktp_size * local_rows, hidden_size)
+    if tuple(gathered_values.shape) != expected_values_shape:
+        raise RuntimeError(
+            "KTP FP8 value AllGather returned shape "
+            f"{tuple(gathered_values.shape)}, expected {expected_values_shape}"
+        )
+
+    gathered_scale_wire = all_gather(
+        local_input.scale_wire.contiguous(), group=Group.KTP
+    )
+    expected_scale_shape = (ktp_size * scale_groups, local_scale_columns)
+    if tuple(gathered_scale_wire.shape) != expected_scale_shape:
+        raise RuntimeError(
+            "KTP FP8 scale AllGather returned shape "
+            f"{tuple(gathered_scale_wire.shape)}, expected {expected_scale_shape}"
+        )
+
+    # all_gather concatenates dim 0, yielding [rank, K-group, local-M-pad].
+    # Drop each rank's local alignment columns before concatenating M globally.
+    scale_by_rank = gathered_scale_wire.reshape(
+        ktp_size, scale_groups, local_scale_columns
+    )
+    global_scale_wire = (
+        scale_by_rank[:, :, :local_rows]
+        .permute(1, 0, 2)
+        .contiguous()
+        .reshape(scale_groups, ktp_size * local_rows)
+    )
+    global_aligned_rows = (ktp_size * local_rows + 3) // 4 * 4
+    if global_scale_wire.shape[1] != global_aligned_rows:
+        padded_scale_wire = torch.full(
+            (scale_groups, global_aligned_rows),
+            0x7F7F7F7F,
+            dtype=torch.int32,
+            device=local_input.device,
+        )
+        padded_scale_wire[:, : global_scale_wire.shape[1]].copy_(global_scale_wire)
+        global_scale_wire = padded_scale_wire
+
+    return QuantizedActivation(gathered_values, global_scale_wire)
 
 
 def pack_ktp_projection_payload(
@@ -522,7 +593,10 @@ def project_kda_inputs_ktp(
     physical_batch = int(hidden_states.shape[0])
     local_heads = total_heads // ktp_size
     local_projection_size = local_heads * head_dim
-    gathered_hidden = all_gather(hidden_states.contiguous(), group=Group.KTP)
+    gathered_hidden = _all_gather_projection_input(
+        hidden_states,
+        ktp_size=ktp_size,
+    )
     send = pack_ktp_projection_payload(
         gathered_hidden,
         fused_projection,
