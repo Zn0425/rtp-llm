@@ -860,9 +860,21 @@ class KimiK3LatentMoE(nn.Module):
         sequence_parallel: bool = False,
     ) -> torch.Tensor:
         if self._use_nccl_ep:
-            if sequence_parallel:
-                raise RuntimeError(
-                    "multi-host K3 NCCL EP requires DP-local Decode tokens"
+            # Token-SP Prefill supplies equal padded owner shards, just like
+            # coordinated Decode batches. Padding rows have zero route weights.
+            # Bound grouped-GEMM workspace, which scales with EP and expert count,
+            # without gathering the sequence back onto every TP rank.
+            if sequence_parallel and routed_input.shape[0] > 64:
+                return torch.cat(
+                    [
+                        self._nccl_ep_expert_sum(
+                            routed_input[begin : begin + 64],
+                            expert_ids[begin : begin + 64],
+                            routing_weights[begin : begin + 64],
+                        )
+                        for begin in range(0, routed_input.shape[0], 64)
+                    ],
+                    dim=0,
                 )
             return self._nccl_ep_expert_sum(
                 routed_input,
