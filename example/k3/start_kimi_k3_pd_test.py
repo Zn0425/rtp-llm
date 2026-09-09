@@ -101,10 +101,12 @@ class StartKimiK3PdDryRunTest(unittest.TestCase):
         return self._run(role, topology, **kwargs).stdout
 
     def test_configurable_parallelism_reaches_launcher(self):
-        for tp in (1, 2, 4, 8):
+        for tp in (1, 2, 4, 8, 16):
             for role in ("prefill", "decode"):
                 with self.subTest(tp=tp, role=role):
-                    output = self.run_dry_run(role, KIMI_K3_TP_SIZE=str(tp), KIMI_K3_EP_SIZE=str(tp))
+                    output = self.run_dry_run(
+                        role, KIMI_K3_TP_SIZE=str(tp), KIMI_K3_EP_SIZE=str(tp)
+                    )
                     self.assertIn(f"TP{tp}/DP1/KTP1/EP{tp}", output)
                     self.assertIn(f"--tp_size {tp}", output)
                     self.assertIn(f"--ep_size {tp}", output)
@@ -113,13 +115,36 @@ class StartKimiK3PdDryRunTest(unittest.TestCase):
                     if role == "prefill":
                         self.assertIn(f"shard={int(tp % 2 == 0)}", output)
 
+    def test_tp16_two_node_local_world_size_reaches_launcher(self):
+        for role in ("prefill", "decode"):
+            with self.subTest(role=role):
+                output = self.run_dry_run(
+                    role,
+                    TP_SIZE="16",
+                    DP_SIZE="1",
+                    EP_SIZE="16",
+                    WORLD_SIZE="16",
+                    LOCAL_WORLD_SIZE="8",
+                    KIMI_K3_ATTENTION_QUANTIZATION="fp8_per_block",
+                    KIMI_K3_FP8_COLLECTIVE_GEMM="0",
+                    KIMI_K3_GEMM_REDUCE_SCATTER_BACKEND="nccl",
+                )
+                self.assertIn("TP16/DP1/KTP1/EP16 world=16 local=8", output)
+                self.assertIn("--local_world_size 8", output)
+                self.assertIn("attention quant: fp8_per_block", output)
+
     def test_generic_topology_flags_override_k3_compatibility_aliases(self):
         for role in ("prefill", "decode"):
             with self.subTest(role=role):
                 output = self.run_dry_run(
-                    role, TP_SIZE="4", DP_SIZE="1", EP_SIZE="4",
-                    WORLD_SIZE="4", LOCAL_WORLD_SIZE="4",
-                    KIMI_K3_TP_SIZE="8", KIMI_K3_EP_SIZE="8",
+                    role,
+                    TP_SIZE="4",
+                    DP_SIZE="1",
+                    EP_SIZE="4",
+                    WORLD_SIZE="4",
+                    LOCAL_WORLD_SIZE="4",
+                    KIMI_K3_TP_SIZE="8",
+                    KIMI_K3_EP_SIZE="8",
                 )
                 self.assertIn("TP4/DP1/KTP1/EP4 world=4 local=4", output)
                 self.assertIn("--tp_size 4", output)
@@ -137,6 +162,7 @@ class StartKimiK3PdDryRunTest(unittest.TestCase):
                     "think end:       <|close|>think<|sep|><|open|>response<|sep|>",
                     output,
                 )
+
     def test_prefill_ignores_decode_topology(self):
         output = self._dry_run("prefill", "dp16_ktp16_ep16")
         self.assertIn("--tp_size 8", output)
@@ -177,9 +203,7 @@ class StartKimiK3PdDryRunTest(unittest.TestCase):
             "name:k3_part0,ip:10.0.0.1,port:28188;"
             "name:k3_part1,ip:10.0.0.2,port:28188"
         )
-        output = self._dry_run(
-            "decode", "dp16_ktp16_ep16", gang_config=gang
-        )
+        output = self._dry_run("decode", "dp16_ktp16_ep16", gang_config=gang)
         self.assertIn("--tp_size 1", output)
         self.assertIn("--dp_size 16", output)
         self.assertIn("--ktp_size 16", output)
@@ -197,9 +221,7 @@ class StartKimiK3PdDryRunTest(unittest.TestCase):
         self.assertIn("--world_rank 8", second_node)
 
     def test_decode_projection_ktp16_requires_gang_and_node_base_rank(self):
-        missing_gang = self._run(
-            "decode", "dp16_ktp16_ep16", check=False
-        )
+        missing_gang = self._run("decode", "dp16_ktp16_ep16", check=False)
         self.assertNotEqual(missing_gang.returncode, 0)
         self.assertIn("GANG_CONFIG_STRING", missing_gang.stderr)
 

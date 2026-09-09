@@ -38,7 +38,7 @@ weight padding is used by this implementation.
 
 The loader subclasses the existing `LoadQuantPerBlockFp8Weight`, but is only
 selected by the K3 attention manifest. LoRA merging and TP sizes outside
-1/2/4/8 fail explicitly. It does not join the global quantizer registry.
+1/2/4/8/16 fail explicitly. It does not join the global quantizer registry.
 `K3_FP8_WEIGHT` log entries describe logical shapes, packed scales, TP rank,
 derivation and weight padding; retain them with each run.
 
@@ -76,7 +76,7 @@ Build on 115 in lhc_GPU as the normal user with
 `--config=cuda13 --config=sm10x`.
 
 * `//rtp_llm/models_py/modules/hybrid/test:kimi_k3_fp8_weight_test` covers tails,
-  TP1/2/4/8 KDA layout, final-quantized KV_B derivation and policy isolation.
+  TP1/2/4/8/16 KDA layout, final-quantized KV_B derivation and policy isolation.
 * `fp8_shape_probe.py` checks logical dimensions against independently
   dequantized operands on the installed DeepGEMM.
 * `//example/k3:fp8_runtime_probe` exercises the actual loader, packing, Linear factory,
@@ -95,3 +95,41 @@ kernel correctness from model quality and performance. Standalone kernel and
 Graph passes do not constitute full-model acceptance. Full PD, 93-layer,
 110k-context and measured performance results must be recorded before claiming
 complete delivery.
+
+## TP16 reference path
+
+The loader accepts TP16 with the same 128-element shard alignment checks.
+Source example/k3/tp16_fp8_reference.env for the first-stage reference
+configuration on every worker of a two-host, eight-GPUs-per-host replica.
+Set host/rank discovery and P/D endpoints for the actual topology separately.
+TP16/EP16/world16 describe one replica; two eight-GPU machines split between
+independent Prefill and Decode replicas still provide only TP8 per role.
+
+The preset keeps FP8 projection weights and uses explicit communication.
+It disables the separate MLA FP8 compute/cache option for the initial baseline.
+BF16 draft paths also select NCCL RS. Fused GEMM/RS remains restricted to
+TP2/4/8; this change does not enable its TP16 workspace or kernel.
+
+For the documented K3 geometry (hidden=7168, heads=96, KDA head_dim=128):
+
+| Projection | TP16 logical [out,in] |
+|---|---|
+| KDA Q/K/V/G + replicated F_A/beta | [3296,7168] |
+| KDA F_B | [768,128] |
+| KDA O | [7168,768] |
+| MLA Q_A + KV_A (replicated) | [2112,7168] |
+| MLA gate | [768,7168] |
+| MLA Q_B | [1152,1536] |
+| MLA KV_B | [1536,512] |
+| MLA O | [7168,768] |
+
+Q/K/V/G each own six complete KDA heads. The 224-row F_A/beta tail and
+its two scale rows remain replicated. Row-parallel projections have six
+128-element K groups: packed UE8M0 scales must handle the partial last word.
+MLA KC/VC still derive from each rank's final quantized KV_B.
+
+Validation is layered: CPU shard reconstruction and scale/tail checks,
+single-GPU FP8 shape/packing checks, then actual 16-GPU communication and
+model validation. A single-GPU probe using a TP16 shard is not a 16-GPU
+integration test. Record the tested dependency versions and any pending
+integration checks before using this configuration for deployment.

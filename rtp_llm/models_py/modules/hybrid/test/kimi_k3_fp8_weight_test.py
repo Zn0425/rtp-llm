@@ -45,7 +45,7 @@ class KimiK3Fp8WeightTest(unittest.TestCase):
         width = 4 * 12288 + 128 + 96
         weight = torch.arange(width, dtype=torch.float32)[:, None].expand(width, 128)
         scales = torch.arange((width + 127) // 128, dtype=torch.float32)[:, None]
-        for tp in (1, 2, 4, 8):
+        for tp in (1, 2, 4, 8, 16):
             for rank in range(tp):
                 out = wrapper._split(
                     {wrapper.kernel.name: weight, wrapper.scale.name: scales},
@@ -53,6 +53,16 @@ class KimiK3Fp8WeightTest(unittest.TestCase):
                 )
                 w, s = out[wrapper.kernel.name], out[wrapper.scale.name]
                 self.assertEqual(w.shape, (4 * 12288 // tp + 224, 128))
+                self.assertEqual(s.shape, (4 * 96 // tp + 2, 1))
+                for part in range(4):
+                    local_blocks = 96 // tp
+                    begin = part * 96 + rank * local_blocks
+                    torch.testing.assert_close(
+                        s[part * local_blocks : (part + 1) * local_blocks],
+                        scales[begin : begin + local_blocks],
+                        rtol=0,
+                        atol=0,
+                    )
                 torch.testing.assert_close(w[-224:], weight[-224:], rtol=0, atol=0)
                 torch.testing.assert_close(s[-2:], scales[-2:], rtol=0, atol=0)
                 for part in range(4):
@@ -79,14 +89,12 @@ class KimiK3Fp8WeightTest(unittest.TestCase):
             config=cfg,
             projection_ktp=True,
         )
-        fused = KimiK3LoadFp8Weight(
-            fused_source, Fp8BlockWiseQuantConfig()
-        )
+        fused = KimiK3LoadFp8Weight(fused_source, Fp8BlockWiseQuantConfig())
         fused_width = 4 * 12288 + 128 + 96
         fused_weight = torch.arange(fused_width, dtype=torch.float32)[:, None]
-        fused_scale = torch.arange(
-            (fused_width + 127) // 128, dtype=torch.float32
-        )[:, None]
+        fused_scale = torch.arange((fused_width + 127) // 128, dtype=torch.float32)[
+            :, None
+        ]
 
         forget_source = LinearAttnAtomicWeight(
             W.linear_attn_f_b_w,
@@ -95,9 +103,7 @@ class KimiK3Fp8WeightTest(unittest.TestCase):
             config=cfg,
             projection_ktp=True,
         )
-        forget = KimiK3LoadFp8Weight(
-            forget_source, Fp8BlockWiseQuantConfig()
-        )
+        forget = KimiK3LoadFp8Weight(forget_source, Fp8BlockWiseQuantConfig())
         forget_weight = torch.arange(12288, dtype=torch.float32)[:, None]
         forget_scale = torch.arange(12288 // 128, dtype=torch.float32)[:, None]
 
@@ -131,9 +137,7 @@ class KimiK3Fp8WeightTest(unittest.TestCase):
             for part in range(4):
                 begin = part * 12288 + rank * local
                 torch.testing.assert_close(
-                    fused_out[fused.kernel.name][
-                        part * local : (part + 1) * local
-                    ],
+                    fused_out[fused.kernel.name][part * local : (part + 1) * local],
                     fused_weight[begin : begin + local],
                     rtol=0,
                     atol=0,
@@ -155,9 +159,7 @@ class KimiK3Fp8WeightTest(unittest.TestCase):
             )
             torch.testing.assert_close(
                 forget_out[forget.scale.name],
-                forget_scale[
-                    rank * local // 128 : (rank + 1) * local // 128
-                ],
+                forget_scale[rank * local // 128 : (rank + 1) * local // 128],
                 rtol=0,
                 atol=0,
             )
@@ -182,7 +184,7 @@ class KimiK3Fp8WeightTest(unittest.TestCase):
 
     def test_bounded_scratch_quantization_is_bitwise_equal(self):
         torch.manual_seed(19)
-        for rows in (96, 2112, 6368):
+        for rows in (96, 2112, 3296, 6368):
             raw = torch.randn(rows, 256, dtype=torch.bfloat16)
             raw[: min(rows, 128)] = 0
             for ue8m0 in (False, True):
@@ -203,7 +205,7 @@ class KimiK3Fp8WeightTest(unittest.TestCase):
             wrapper = KimiK3LoadFp8Weight(source, Fp8BlockWiseQuantConfig())
             raw = torch.ones(rows, 128, dtype=torch.bfloat16)
             q, scales = per_block_cast_to_fp8(raw, 128, use_ue8m0=True)
-            for tp in (1, 2, 4, 8):
+            for tp in (1, 2, 4, 8, 16):
                 for rank in range(tp):
                     out = wrapper._split(
                         {wrapper.kernel.name: q, wrapper.scale.name: scales},
@@ -224,30 +226,82 @@ class KimiK3Fp8WeightTest(unittest.TestCase):
                     )
 
     def test_kvb_derived_weights_use_final_quantized_values(self):
-        cfg = MlaConfig(head_num=8, nope_head_dim=128, v_head_dim=128, kv_lora_rank=128)
+        cfg = MlaConfig(
+            head_num=32, nope_head_dim=128, v_head_dim=128, kv_lora_rank=128
+        )
         source = MlaAttnAtomicWeight(W.mla_kv_b_w, [], config=cfg)
         wrapper = KimiK3LoadFp8Weight(
             source, Fp8BlockWiseQuantConfig(), derive_mla=True
         )
         wrapper.use_ue8m0 = False
         torch.manual_seed(7)
-        raw = torch.randn(2048, 128, dtype=torch.bfloat16)
+        raw = torch.randn(8192, 128, dtype=torch.bfloat16)
         q, scale = per_block_cast_to_fp8(raw, 128)
         dense = (q.float() * scale.repeat_interleave(128, 0)).to(torch.bfloat16)
-        for tp in (1, 2, 4, 8):
+        for tp in (1, 2, 4, 8, 16):
             for rank in range(tp):
                 load = SimpleNamespace(tp_size=tp, tp_rank=rank)
                 split = wrapper._split(
                     {wrapper.kernel.name: q, wrapper.scale.name: scale}, load
                 )
                 result = wrapper._postprocess(split, "cpu", load)
-                local = dense.chunk(tp)[rank].reshape(8 // tp, 256, 128)
+                local = dense.chunk(tp)[rank].reshape(32 // tp, 256, 128)
                 torch.testing.assert_close(
                     result[W.mla_kc], local[:, :128], rtol=0, atol=0
                 )
                 torch.testing.assert_close(
                     result[W.mla_vc], local[:, 128:].transpose(1, 2), rtol=0, atol=0
                 )
+
+    def test_tp16_projection_shards_reconstruct_weights_and_scales(self):
+        # Catch wrong split axes, missing ranks and scale offsets. Keep one
+        # unsharded dimension small while using the real K3 sharded widths.
+        torch.manual_seed(16)
+        cases = (
+            (W.linear_attn_f_b_w, 12288, 128, 0),
+            (W.linear_attn_out_w, 128, 12288, 1),
+            (W.mla_q_b_w, 18432, 128, 0),
+            (W.mla_kv_b_w, 24576, 128, 0),
+            (W.attn_gate_w, 12288, 128, 0),
+            (W.attn_o_w, 128, 12288, 1),
+        )
+        for name, rows, columns, axis in cases:
+            source = MlaAttnAtomicWeight(name, [], config=MlaConfig())
+            wrapper = KimiK3LoadFp8Weight(source, Fp8BlockWiseQuantConfig())
+            raw = torch.randn(rows, columns, dtype=torch.bfloat16)
+            for ue8m0 in (False, True):
+                with self.subTest(name=name, ue8m0=ue8m0):
+                    q, scales = per_block_cast_to_fp8(raw, 128, use_ue8m0=ue8m0)
+                    shards, scale_shards = [], []
+                    for rank in range(16):
+                        result = wrapper._split(
+                            {wrapper.kernel.name: q, wrapper.scale.name: scales},
+                            SimpleNamespace(tp_size=16, tp_rank=rank),
+                        )
+                        shards.append(result[wrapper.kernel.name].view(torch.uint8))
+                        scale_shards.append(result[wrapper.scale.name])
+                    self.assertTrue(
+                        torch.equal(torch.cat(shards, axis), q.view(torch.uint8))
+                    )
+                    torch.testing.assert_close(
+                        torch.cat(scale_shards, axis), scales, rtol=0, atol=0
+                    )
+
+    def test_tp16_rejects_unaligned_projection_and_invalid_rank(self):
+        source = MlaAttnAtomicWeight(W.mla_q_b_w, [], config=MlaConfig())
+        wrapper = KimiK3LoadFp8Weight(source, Fp8BlockWiseQuantConfig())
+        tensor = {
+            wrapper.kernel.name: torch.ones(1024, 128),
+            wrapper.scale.name: torch.ones(8, 1),
+        }
+        with self.assertRaisesRegex(ValueError, "unaligned K3 FP8 shard"):
+            wrapper._split(tensor, SimpleNamespace(tp_size=16, tp_rank=0))
+        for rank in (-1, 16):
+            with self.assertRaisesRegex(ValueError, "invalid K3 FP8 TP rank"):
+                wrapper._split(tensor, SimpleNamespace(tp_size=16, tp_rank=rank))
+        for tp in (3, 32):
+            with self.assertRaisesRegex(ValueError, "K3 FP8 supports"):
+                wrapper._split(tensor, SimpleNamespace(tp_size=tp, tp_rank=0))
 
     def test_cached_bf16_rs_workspace_validates_fp8_abi(self):
         import importlib.util
@@ -257,7 +311,10 @@ class KimiK3Fp8WeightTest(unittest.TestCase):
         root = Path(__file__).resolve().parents[2] / "kimi_k3"
         with patch.dict(sys.modules):
             for name, filename in (
-                ("rtp_llm.models_py.modules.kimi_k3._collective_gemm", "_collective_gemm.py"),
+                (
+                    "rtp_llm.models_py.modules.kimi_k3._collective_gemm",
+                    "_collective_gemm.py",
+                ),
                 ("_k3_fp8_rs_abi_test", "gemm_reduce_scatter.py"),
             ):
                 spec = importlib.util.spec_from_file_location(name, root / filename)
@@ -270,21 +327,34 @@ class KimiK3Fp8WeightTest(unittest.TestCase):
             group.size.return_value = tp
             workspace = SimpleNamespace()
             state = rs._GemmReduceScatterState(
-                True, group, torch.device("cuda", 0), tp, 32768, 7168,
+                True,
+                group,
+                torch.device("cuda", 0),
+                tp,
+                32768,
+                7168,
                 SimpleNamespace(_C=SimpleNamespace(bf16_gemm_rs_reduce=Mock())),
                 workspace,
             )
             with patch.dict(rs._STATES, {(group, 0): state}, clear=True):
                 kwargs = dict(enabled=True, max_m=32768, n=7168)
-                self.assertTrue(rs.configure_gemm_reduce_scatter(group, "cuda:0", **kwargs))
+                self.assertTrue(
+                    rs.configure_gemm_reduce_scatter(group, "cuda:0", **kwargs)
+                )
                 with self.assertRaisesRegex(RuntimeError, "FP8 peer-output RS ABI"):
-                    rs.configure_gemm_reduce_scatter(group, "cuda:0", fp8=True, **kwargs)
+                    rs.configure_gemm_reduce_scatter(
+                        group, "cuda:0", fp8=True, **kwargs
+                    )
                 workspace._data_offset_bytes = 128
                 workspace._mapping_handle = object()
                 workspace._launch_lock = object()
                 workspace._last_stream = None
                 workspace._barrier = Mock()
-                self.assertTrue(rs.configure_gemm_reduce_scatter(group, "cuda:0", fp8=True, **kwargs))
+                self.assertTrue(
+                    rs.configure_gemm_reduce_scatter(
+                        group, "cuda:0", fp8=True, **kwargs
+                    )
+                )
 
     def test_attention_config_enables_mtp_but_not_eagle3_or_global_quantization(self):
         from rtp_llm.config.model_config import ModelConfig
@@ -297,16 +367,23 @@ class KimiK3Fp8WeightTest(unittest.TestCase):
             config.attn_config.use_mla = True
             config.quant_config = None
             with patch.dict(
-                os.environ, {"KIMI_K3_ATTENTION_QUANTIZATION": "fp8_per_block", "KIMI_K3_MLA_FP8": "1"}
+                os.environ,
+                {
+                    "KIMI_K3_ATTENTION_QUANTIZATION": "fp8_per_block",
+                    "KIMI_K3_MLA_FP8": "1",
+                },
             ):
                 with patch.object(
                     ModelConfig, "init_precision_config", return_value=None
                 ):
                     config.init_precision_config(None, None)
             self.assertIsNone(config.quant_config)
-            self.assertEqual(config.attn_config.mla_fp8_compute, "eagle3" not in model_type)
+            self.assertEqual(
+                config.attn_config.mla_fp8_compute, "eagle3" not in model_type
+            )
             if "eagle3" not in model_type:
                 from rtp_llm.ops import KvCacheDataType
+
                 self.assertEqual(config.attn_config.kv_cache_dtype, KvCacheDataType.FP8)
             self.assertEqual(
                 config.k3_attention_quant_config is not None, "eagle3" not in model_type
@@ -320,6 +397,7 @@ class KimiK3Fp8WeightTest(unittest.TestCase):
         # Test the CPU control flow without importing the CUDA factory registry.
         # The real collective functions are loaded; only their I/O is mocked below.
         root = Path(__file__).resolve().parents[2] / "kimi_k3"
+
         def load(name, filename):
             spec = importlib.util.spec_from_file_location(name, root / filename)
             module = importlib.util.module_from_spec(spec)
@@ -328,36 +406,42 @@ class KimiK3Fp8WeightTest(unittest.TestCase):
             return module
 
         with patch.dict(sys.modules):
-            load("rtp_llm.models_py.modules.kimi_k3._collective_gemm", "_collective_gemm.py")
+            load(
+                "rtp_llm.models_py.modules.kimi_k3._collective_gemm",
+                "_collective_gemm.py",
+            )
             ag = load("_k3_fp8_test_ag", "all_gather_gemm.py")
             rs = load("_k3_fp8_test_rs", "gemm_reduce_scatter.py")
-        group = Mock()
-        group.size.return_value = 8
-        source = Mock(is_cuda=True, device=torch.device("cuda", 0), shape=(4096, 1))
-        source.new_empty.side_effect = lambda shape: torch.empty(shape)
-        gathered = torch.zeros(32768, 1)
-        expected = torch.ones(32768, 1)
-        projection = Mock()
-        projection.quantize_input.return_value = (gathered, torch.ones(1))
-        projection.forward_quantized.return_value = expected
-        with (
-            patch.dict(os.environ, {"KIMI_K3_FP8_COLLECTIVE_GEMM": "0"}),
-            patch.object(ag, "get_process_group", return_value=group),
-            patch.dict(
-                ag._STATES, {(group, 0): SimpleNamespace(enabled=True)}, clear=True
-            ),
-            patch.object(ag, "all_gather_into", return_value=gathered) as gather,
-            patch.object(ag, "fused_all_gather_fp8_linear") as fused_ag,
-            patch.object(rs, "_fp8_remote_gemm_reduce_scatter") as fused_rs,
-        ):
-            actual = ag.all_gather_gemm(source, [projection], logical_m=32768)[0]
-            torch.testing.assert_close(actual, expected)
-            gather.assert_called_once()
-            fused_ag.assert_not_called()
-            self.assertIsNone(
-                rs.gemm_reduce_scatter(source, projection, group, pad_rows=False)
+        for tp in (8, 16):
+            group = Mock()
+            group.size.return_value = tp
+            source = Mock(
+                is_cuda=True, device=torch.device("cuda", 0), shape=(32768 // tp, 1)
             )
-            fused_rs.assert_not_called()
+            source.new_empty.side_effect = lambda shape: torch.empty(shape)
+            gathered = torch.zeros(32768, 1)
+            expected = torch.ones(32768, 1)
+            projection = Mock()
+            projection.quantize_input.return_value = (gathered, torch.ones(1))
+            projection.forward_quantized.return_value = expected
+            with (
+                patch.dict(os.environ, {"KIMI_K3_FP8_COLLECTIVE_GEMM": "0"}),
+                patch.object(ag, "get_process_group", return_value=group),
+                patch.dict(
+                    ag._STATES, {(group, 0): SimpleNamespace(enabled=True)}, clear=True
+                ),
+                patch.object(ag, "all_gather_into", return_value=gathered) as gather,
+                patch.object(ag, "fused_all_gather_fp8_linear") as fused_ag,
+                patch.object(rs, "_fp8_remote_gemm_reduce_scatter") as fused_rs,
+            ):
+                actual = ag.all_gather_gemm(source, [projection], logical_m=32768)[0]
+                torch.testing.assert_close(actual, expected)
+                gather.assert_called_once()
+                fused_ag.assert_not_called()
+                self.assertIsNone(
+                    rs.gemm_reduce_scatter(source, projection, group, pad_rows=False)
+                )
+                fused_rs.assert_not_called()
 
     def test_native_moe_cannot_enter_attention_policy(self):
         self.assertNotIn(W.moe_w1, KimiK3LoadFp8Weight.w8a8_weight_list)

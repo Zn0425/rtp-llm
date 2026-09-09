@@ -85,16 +85,12 @@ class KimiK3LoadFp8Weight(LoadQuantPerBlockFp8Weight):
         tp, tp_rank = load_config.tp_size, load_config.tp_rank
         ktp = getattr(load_config, "ktp_size", 1)
         ktp_rank = getattr(load_config, "ktp_rank", 0)
-        projection_ktp = (
-            bool(getattr(self.source, "projection_ktp", False)) and ktp > 1
-        )
+        projection_ktp = bool(getattr(self.source, "projection_ktp", False)) and ktp > 1
         parallel, rank = (ktp, ktp_rank) if projection_ktp else (tp, tp_rank)
         parallel_name = "KTP" if projection_ktp else "TP"
         if not 0 <= rank < parallel:
-            raise ValueError(
-                f"invalid K3 FP8 {parallel_name} rank: {rank}/{parallel}"
-            )
-        supported = (8, 16) if projection_ktp else (1, 2, 4, 8)
+            raise ValueError(f"invalid K3 FP8 {parallel_name} rank: {rank}/{parallel}")
+        supported = (8, 16) if projection_ktp else (1, 2, 4, 8, 16)
         if parallel not in supported:
             raise ValueError(
                 f"K3 FP8 supports {parallel_name} sizes {supported}, got {parallel}"
