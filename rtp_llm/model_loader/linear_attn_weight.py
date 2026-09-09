@@ -367,19 +367,24 @@ class LinearAttnAtomicWeight(AtomicWeight):
     ) -> Dict[str, torch.Tensor]:
         if isinstance(tensor, dict):
             tensor = tensor[self.name]
-        if self.projection_ktp and load_config.ktp_size > 1:
+        # Older loaders and lightweight test manifests may not carry the KTP
+        # fields.  Preserve their historical KTP1 behavior while the serving
+        # LoadConfig continues to provide the explicit runtime topology.
+        ktp_size = int(getattr(load_config, "ktp_size", 1))
+        ktp_rank = int(getattr(load_config, "ktp_rank", 0))
+        if self.projection_ktp and ktp_size > 1:
             if self.name == W.linear_attn_qkvg_fa_beta_w:
                 result = split_kda_qkvg_fa_beta_parallel(
                     tensor,
-                    parallel_size=load_config.ktp_size,
-                    parallel_rank=load_config.ktp_rank,
+                    parallel_size=ktp_size,
+                    parallel_rank=ktp_rank,
                     linear_config=self.config,
                 )
             elif self.name == W.linear_attn_f_b_w:
                 result = split_kda_dim1_parallel(
                     tensor,
-                    parallel_size=load_config.ktp_size,
-                    parallel_rank=load_config.ktp_rank,
+                    parallel_size=ktp_size,
+                    parallel_rank=ktp_rank,
                 )
             else:
                 raise ValueError(
